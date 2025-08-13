@@ -3,13 +3,14 @@ import torch.nn.functional as F
 
 def torch_filtfilt(b, a, x):
     """
-    PyTorch implementation of SciPy's filtfilt with 'gust' method.
+    PyTorch implementation of SciPy's filtfilt with Gustafsson’s method.
     Matches SciPy's reflection padding logic for FIR/IIR filters.
     
     Parameters
     ----------
     b : torch.Tensor
         Numerator filter coefficients (1D).
+        (also called taps)
     a : torch.Tensor
         Denominator filter coefficients (1D).
     x : torch.Tensor
@@ -25,15 +26,15 @@ def torch_filtfilt(b, a, x):
             b = b / a[0]
             a = a / a[0]
 
-    # Pad length (SciPy uses 3 * max(len(a), len(b)))
+    # Pad length 
     padlen = 3 * max(len(a), len(b))
     if x.numel() <= padlen:
         raise ValueError("Input signal too short for filtfilt padding")
 
-    # Reflection padding (like SciPy)
-    # Front pad: 2*x0 - x[1:padlen+1]
+    # Reflection padding 
+    # Front pad
     front = 2 * x[0] - x[1:padlen+1].flip(0)
-    # End pad: 2*x[-1] - x[-padlen-1:-1]
+    # End pad
     end = 2 * x[-1] - x[-padlen-1:-1].flip(0)
     x_pad = torch.cat([front, x, end])
 
@@ -57,7 +58,8 @@ def torch_filtfilt(b, a, x):
 
 def torch_lfilter(b, a, x):
     """
-    Direct-form II transposed filter implementation in PyTorch.
+    Direct-form II transposed IIR filter implementation in PyTorch.
+    if a = [1] feedback is skiped resulting in an FIR filter.
     """
     b = b.to(dtype=torch.float64)
     a = a.to(dtype=torch.float64)
