@@ -2,14 +2,18 @@ import pickle as pkl
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.signal import kaiserord, firwin, freqz, filtfilt
+from scipy.signal import kaiserord, firwin, freqz
 from scipy.fft import fft, fftfreq
 from scipy import signal
 import numpy as np
+from torch_filter import torch_filtfilt
+# path = '/home/ethanl/data/mike-20250806_130228/happy_v3_1_22_07_25_7_/sim_data.pkl'
+# path = '/home/ethanl/data/neil-20250804_134921/develop_projects_happy_v3_1_29_07_25_8/sim_data.pkl'
+# path = '/home/ethanl/data/mike-20250806_142049/happy_v3_1_06_08_25_2_/sim_data.pkl'
+path = '/home/ethanl/data/mike-20250805_153142/happy_v3_1_05_08_25_13_/sim_data.pkl'
 
-path = '/home/ethanl/data/mike-20250806_130228/happy_v3_1_22_07_25_7_/sim_data.pkl'
 obs = 'get_imu_ang_v_local'
-sim_env = 0
+sim_env = 1
 with open(path, 'rb') as f:
     data = pkl.load(f)
 
@@ -34,10 +38,9 @@ numtaps, beta = kaiserord(20, 300/(0.5*1000))
 taps = firwin(numtaps, 125, window=('kaiser', beta),
                   scale=False, fs=1000)
 filtered = {'x': None,'y': None,'z': None}
-filtered['x'] = filtfilt(taps, [1], imu['real']['x'])
-filtered['y'] = filtfilt(taps, [1], imu['real']['y'])
-filtered['z'] = filtfilt(taps, [1], imu['real']['z'])
-
+filtered['x'] = torch_filtfilt(taps, [1], imu['real']['x'])
+filtered['y'] = torch_filtfilt(taps, [1], imu['real']['y'])
+filtered['z'] = torch_filtfilt(taps, [1], imu['real']['z'])
 
 plt.figure(figsize=(10, 6))
 
@@ -66,10 +69,12 @@ for idx, axis in enumerate(axes):
     filtered_f = fft(filtered[axis])
     imu_real_f = fft(imu['real'][axis])
     imu_sim_f = fft(imu['sim'][axis])
+    print(f"Before filter distance in frequency domain {axes} axis:  {np.linalg.norm(imu_sim_f-imu_real_f)}")
+    print(f"After filter distancein frequency domain {axes} axis: {np.linalg.norm(filtered_f-imu_real_f)}")
 
-    axs[idx].plot(xf, 2.0/N * np.abs(filtered_f[0:N//2]), label='Filtered')
     axs[idx].plot(xf, 2.0/N * np.abs(imu_real_f[0:N//2]), label='Real')
     axs[idx].plot(xf, 2.0/N * np.abs(imu_sim_f[0:N//2]), label='Sim')
+    axs[idx].plot(xf, 2.0/N * np.abs(filtered_f[0:N//2]), label='Filtered', linestyle='--')
 
     axs[idx].set_title(f'{axis.upper()} Axis FFT')
     axs[idx].set_ylabel('Amplitude')
@@ -79,4 +84,22 @@ for idx, axis in enumerate(axes):
 axs[-1].set_xlabel('Frequency (Hz)')
 
 plt.tight_layout()
+plt.show()
+
+#plot histograms
+fig_hist, axs_hist = plt.subplots(3, 1, figsize=(10, 8), sharex=False)
+
+for idx, axis in enumerate(axes):
+    axs_hist[idx].hist(imu['real'][axis], bins=30, alpha=0.5, label='Real')
+    axs_hist[idx].hist(imu['sim'][axis], bins=30, alpha=0.5, label='Sim')
+    axs_hist[idx].hist(filtered[axis], bins=30, alpha=0.5, label='Filtered', linestyle='--')
+
+    axs_hist[idx].set_title(f'{axis.upper()} Axis Histogram')
+    axs_hist[idx].set_ylabel('Count')
+    axs_hist[idx].grid(True)
+    axs_hist[idx].legend()
+
+axs_hist[-1].set_xlabel('Value')
+plt.tight_layout()
+
 plt.show()
