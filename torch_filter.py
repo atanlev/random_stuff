@@ -82,3 +82,51 @@ def torch_lfilter(b, a, x):
         zi[-1] = b_pad[N - 1] * x[n] - a_pad[N - 1] * y[n]
 
     return y
+
+class RealTimeIIR:
+    """
+    PyTorch implementation of a real time direct form I causal FIR/IIR filter
+    i.e. y[n] = (1/a[0]) * ( Σ_{k=0}^{M} b[k] x[n-k]  -  Σ_{k=1}^{N} a[k] y[n-k] )
+    """
+    def __init__(self, b, a, device="cpu"):
+        """
+        Initialize filter with given filter coefficients,
+        initialize sample history, filter history.
+
+        Note
+        ----
+        - sample_history stores the past input samples (length len(b)-1).
+        - filter_history stores the past output samples (length len(a)-1).
+          Only used when len(a) > 1 (i.e. IIR case).        
+
+        Parameters
+        ----------
+        b : torch.Tensor
+            Numerator (FIR) coefficients.
+        a : torch.Tensor
+            Denominator (IIR) coefficients. a[0] is assumed nonzero (usually 1).
+        """
+        self.b = torch.tensor(b, dtype=torch.float32, device=device)
+        self.a = torch.tensor(a, dtype=torch.float32, device=device)
+        # normalize to ensure a[0] == 1
+        self.b = self.b / self.a[0]
+        self.a = self.a / self.a[0]        
+
+        self.sample_history = torch.zeros(len(b)-1, dtype=torch.float32, device=device)
+        if len(self.a) > 1:
+            self.filter_history = torch.zeros(len(a)-1, dtype=torch.float32, device=device)
+
+    def step(self, new_sample):
+        sample_window = torch.cat((new_sample.view(1), self.sample_history))
+        if len(self.a) > 1:
+            y_new = self.b @ sample_window - self.a[1:] @ self.filter_history
+        else:
+            y_new = self.b @ sample_window
+
+        self.sample_history = sample_window[:-1]
+        if len(self.a) > 1:
+            self.filter_history = torch.cat((y_new.view(1), self.filter_history[:-1]))
+
+        return y_new
+    
+
