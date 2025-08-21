@@ -13,10 +13,10 @@
             "console": "integratedTerminal",
             "args": ["--paths", 
                     "/home/ethanl/data/mike-20250806_130228/happy_v3_1_22_07_25_7_/sim_data.pkl",
-                    "/home/ethanl/data/neil-20250804_134921/develop_projects_happy_v3_1_29_07_25_8/sim_data.pkl",
-                    "/home/ethanl/data/mike-20250806_142049/happy_v3_1_06_08_25_2_/sim_data.pkl",
-                    "/home/ethanl/data/mike-20250805_153142/happy_v3_1_05_08_25_13_/sim_data.pkl",
-                    "/home/ethanl/data/logs/mike-20250818_153221/happy_v3_1_07_08_25_6_/sim_data.pkl",
+                    // "/home/ethanl/data/neil-20250804_134921/develop_projects_happy_v3_1_29_07_25_8/sim_data.pkl",
+                    // "/home/ethanl/data/mike-20250806_142049/happy_v3_1_06_08_25_2_/sim_data.pkl",
+                    // "/home/ethanl/data/mike-20250805_153142/happy_v3_1_05_08_25_13_/sim_data.pkl",
+                    // "/home/ethanl/data/logs/mike-20250818_153221/happy_v3_1_07_08_25_6_/sim_data.pkl",
                 ]
         }
     ]

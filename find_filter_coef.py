@@ -10,7 +10,7 @@ from torch_filter import torch_filtfilt, RealTimeIIR
 
 # -------------------------
 # Config (edit as needed)
-# -------------------------
+# -------------------------<
 DEFAULT_PATH = '/home/ethanl/data/mike-20250806_130228/happy_v3_1_22_07_25_7_/sim_data.pkl'
 DEFAULT_OBS = 'get_imu_ang_v_local'   # or 'get_lin_acc_local', etc.
 FS = 210.0                            # sampling rate (Hz)
@@ -22,12 +22,12 @@ PRINT_EVERY = 200
 SEED = 42
 
 # Annealing schedule
-INIT_STEP = 0.08                      # initial noise scale for tap changes
+INIT_STEP = 0.1                      # initial noise scale for tap changes
 FINAL_STEP = 0.01
 INIT_TEMP = 2
-FINAL_TEMP = 0.01
+FINAL_TEMP = 0.005
 
-# Try variable tap lengths too? (3..MAX_TAPS)
+# Try variable tap lengths too (1 - MAX_TAPS)
 ALLOW_LENGTH_CHANGES = False
 LEN_CHANGE_PROB = 0.1                # probability to attempt length +/- 1
 
@@ -110,9 +110,9 @@ def compute_loss(b_dict, imu, fs=FS):
         filter_rt = RealTimeIIR(b, [1])
         fr = RT_FIR(imu, filter_rt)
 
-        sim_t = sim_t/np.linalg.norm(sim_t)
-        fr = fr/np.linalg.norm(fr)
-        total_time += l2(fr, sim_t)
+        # sim_t = sim_t/np.linalg.norm(sim_t)
+        # fr = fr/np.linalg.norm(fr)
+        total_time += l2(np.abs(fr), np.abs(fr))
 
         N = len(real_t)
         fr_f   = np.abs(rfft(fr))
@@ -121,20 +121,40 @@ def compute_loss(b_dict, imu, fs=FS):
 
     return ALPHA * total_time + BETA * total_freq, total_time, total_freq
 
+# def normalize_taps(b):
+#     """
+#     Keep taps bounded & normalized:
+#     - Center to zero-mean (avoid DC bias drift between steps)
+#     - L1-normalize absolute sum to ~1 to keep gain tame
+#     """
+#     b = np.asarray(b, dtype=np.float64)
+#     if b.size == 0:
+#         return b
+#     b = b - b.mean()
+#     s = np.sum(np.abs(b))
+#     if s < 1e-9:
+#         return np.zeros_like(b) + 1.0 / max(1, len(b))
+#     return b / s
+
+
 def normalize_taps(b):
     """
     Keep taps bounded & normalized:
     - Center to zero-mean (avoid DC bias drift between steps)
-    - L1-normalize absolute sum to ~1 to keep gain tame
+    - L2-normalize (energy of taps = 1) to keep gain stable
     """
     b = np.asarray(b, dtype=np.float64)
     if b.size == 0:
         return b
-    b = b - b.mean()
-    s = np.sum(np.abs(b))
-    if s < 1e-9:
-        return np.zeros_like(b) + 1.0 / max(1, len(b))
-    return b / s
+    
+    b = b - b.mean()  # zero-mean
+    norm = np.linalg.norm(b)
+    if norm < 1e-12:
+        # fallback: uniform taps
+        return np.ones_like(b) / max(1, len(b))
+    
+    return b / norm
+
 
 def propose_neighbor_dict(b_dict, step_scale, allow_len_changes=True):
     new_dict = {}
@@ -179,8 +199,8 @@ def run_optimization(paths, obs, sim_env=0, init_len=5):
         imus.append(imu)
 
     # Initialize taps + best state per axis
-    init_len = int(np.clip(init_len, 3, MAX_TAPS))
-    best_b = {axis: normalize_taps(np.ones(init_len) / init_len) for axis in ['x','y','z']}
+    init_len = int(np.clip(init_len, 1, MAX_TAPS))
+    best_b = {axis: normalize_taps(np.concatenate([np.zeros(init_len - 1), np.array([1])]) / init_len) for axis in ['x','y','z']}
     best_loss = {}
     for axis in ['x','y','z']:
         loss = 0.0
@@ -212,9 +232,9 @@ def run_optimization(paths, obs, sim_env=0, init_len=5):
                   " ".join([f"{ax}_taps={len(best_b[ax])} loss={best_loss[ax]:.6f}"
                             for ax in ['x','y','z']]) +
                   f" step={step:.4f} temp={temp:.4f}")
-            for axis in ['x','y','z']:
-                print(f"{axis}-axis taps ({len(best_b[axis])}): {np.array2string(best_b[axis], precision=6, separator=', ')}")
-                print(f"Best {axis}-axis loss: {best_loss[axis]:.6f}")
+            # for axis in ['x','y','z']:
+            #     print(f"{axis}-axis taps ({len(best_b[axis])}): {np.array2string(best_b[axis], precision=6, separator=', ')}")
+            #     print(f"Best {axis}-axis loss: {best_loss[axis]:.6f}")
 
 
     dt = time.time() - t0
@@ -235,9 +255,9 @@ def main():
                         help="One or more paths to sim_data.pkl files")
     parser.add_argument("--obs", type=str, default='get_imu_ang_v_local', help="Observation key")
     parser.add_argument("--init_len", type=int, default=4, help="Initial number of taps (1..9)")
-    parser.add_argument("--iters", type=int, default=4000, help="Iterations")
-    parser.add_argument("--alpha", type=float, default=1.0, help="Time-domain weight")
-    parser.add_argument("--beta", type=float, default=0.0, help="Freq-domain weight")
+    parser.add_argument("--iters", type=int, default=16000, help="Iterations")
+    parser.add_argument("--alpha", type=float, default=0.0, help="Time-domain weight")
+    parser.add_argument("--beta", type=float, default=1.0, help="Freq-domain weight")
     parser.add_argument("--fs", type=float, default=210, help="Sampling frequency")
     parser.add_argument("--seed", type=int, default=10, help="RNG seed")
     args = parser.parse_args()
