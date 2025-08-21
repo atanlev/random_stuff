@@ -8,17 +8,23 @@ from scipy import signal
 import numpy as np
 from torch_filter import torch_filtfilt, RealTimeIIR
 
-# path = '/home/ethanl/data/mike-20250806_130228/happy_v3_1_22_07_25_7_/sim_data.pkl'
+path = '/home/ethanl/data/mike-20250806_130228/happy_v3_1_22_07_25_7_/sim_data.pkl'
 # path = '/home/ethanl/data/neil-20250804_134921/develop_projects_happy_v3_1_29_07_25_8/sim_data.pkl'
 # path = '/home/ethanl/data/mike-20250806_142049/happy_v3_1_06_08_25_2_/sim_data.pkl'
 # path = '/home/ethanl/data/mike-20250805_153142/happy_v3_1_05_08_25_13_/sim_data.pkl'
-path = '/home/ethanl/data/logs/mike-20250818_153221/happy_v3_1_07_08_25_6_/sim_data.pkl' #unfiltered
+# path = '/home/ethanl/data/logs/mike-20250818_153221/happy_v3_1_07_08_25_6_/sim_data.pkl' #unfiltered
 # path = '/home/ethanl/data/logs/mike-20250818_154125/happy_v3_1_18_08_25_1_/sim_data.pkl' #fir
 
-# obs = 'get_imu_ang_v_local'
+obs = 'get_imu_ang_v_local'
+# obs = 'get_lin_acc_local'
 # obs = 'get_imu_quat_normalized_heading'
-obs = 'get_imu_euler_normalized_heading'
+# obs = 'get_imu_euler_normalized_heading'
 # obs = 'get_imu_ang_v_local_filtered_fir'
+
+
+overright_taps = True
+TAPS =  [ 0.142497,  0.255589, -0.111469,  0.063421, -0.004982, -0.213189,
+  0.038493, -0.068684, -0.101675]
 
 def delay(b, a):
     w, h = freqz(b, a, worN=512)
@@ -34,7 +40,7 @@ def delay(b, a):
 def get_imu_data(data, sim_env, obs):
     obs_range = data['observation_idx_dict']['actor'][obs]
     idx = list(range(obs_range[0],obs_range[1]))
-    real_imu_tensor = data['real_obs']['get_imu_quat_normalized_heading']
+    real_imu_tensor = data['real_obs'][obs]
     sim_imu_tensor = data['sim_obs'][0]['standing']['actor'][sim_env,idx].unsqueeze(0)
     for i in range(1, len(data['sim_obs'])):
         sim_imu_tensor = torch.cat([sim_imu_tensor,data['sim_obs'][i]['standing']['actor'][sim_env,idx].unsqueeze(0)], dim = 0)
@@ -51,12 +57,15 @@ def get_imu_data(data, sim_env, obs):
     
     return imu
 
-def FIR_filter(imu, ripple=20, width=300, fs=1000, cutoff=125):
+def FIR_filter(imu,ripple=20, width=300, fs=1000, cutoff=125):
     numtaps, beta = kaiserord(ripple, width/(0.5*fs))
-    taps = firwin(numtaps, cutoff, window=('kaiser', beta),
-                    scale=False, fs=fs)
-    taps = torch.tensor(taps)
-    a = torch.tensor([1])
+    taps = firwin(numtaps, cutoff,
+                window=('kaiser', beta),
+                scale=False,
+                fs=fs,
+                pass_zero=False)
+    taps = torch.tensor(taps, dtype=torch.float32)
+    a = torch.tensor([1.0], dtype=torch.float32)
     filtered = {'x': None,'y': None,'z': None}
     filtered['x'] = torch_filtfilt(taps, a, imu['real']['x'])
     filtered['y'] = torch_filtfilt(taps, a, imu['real']['y'])
@@ -76,18 +85,26 @@ def RT_FIR(imu, filter_rt, state='real'):
         rt_filtered[axis] = torch.tensor(rt_filtered[axis])
     return rt_filtered
 
-def time_domain_plots(imu,filtered):
-    plt.figure(figsize=(10, 6))
+def time_domain_plots(imu, filtered):
+    axes = ['x', 'y', 'z']
+    N = len(imu['real']['x'])
+    x = np.arange(N)
 
-    plt.plot(imu['real']['x'], label='Real X', color='red')
-    plt.plot(imu['sim']['x'], label='Sim X', color='blue')
-    plt.plot(filtered['x'], label='Filtered', color='green', linestyle='--')
+    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
 
-    plt.xlabel('Sample Index')
-    plt.ylabel('Normalized IMU Reading')
-    plt.title('IMU X-Axis Comparison: Real vs Sim')
-    plt.legend()
-    plt.grid(True)
+    for idx, axis in enumerate(axes):
+        print(f"Before filter distance in time domain {axes} axis:  {torch.norm(imu['real'][axis]-imu['sim'][axis])}")
+        print(f"After filter distancein time domain {axes} axis: {torch.norm(filtered[axis]-imu['sim'][axis])}")
+        axs[idx].plot(x, imu['real'][axis], label='Real', color='red')
+        axs[idx].plot(x, imu['sim'][axis], label='Sim', color='blue')
+        axs[idx].plot(x, filtered[axis], label='Filtered', color='green', linestyle='--')
+
+        axs[idx].set_title(f'{axis.upper()} Axis Time Domain')
+        axs[idx].set_ylabel('IMU Reading')
+        axs[idx].grid(True)
+        axs[idx].legend()
+
+    axs[-1].set_xlabel('Sample Index')
 
     plt.tight_layout()
     plt.show()
@@ -169,10 +186,13 @@ if __name__ == '__main__':
         data = pkl.load(f)
 
     imu = get_imu_data(data=data, sim_env=sim_env, obs=obs)
-    filtered, taps, a = FIR_filter(imu) #, ripple=10, width=300, fs=1000, cutoff=250)
+    filtered, taps, a = FIR_filter(imu, ripple=8, width=6, fs=210, cutoff=[5, 50])
+    if overright_taps:
+        print('Using given taps')
+        taps = TAPS
     filter_rt = RealTimeIIR(taps, a)
     filtered_real = RT_FIR(imu, filter_rt)
-    filtered_sim = RT_FIR(imu, filter_rt)
+    filtered_sim = RT_FIR(imu, filter_rt, state='sim')
 
     time_domain_plots(imu, filtered_real)
     fft_plots(imu, filtered_real)
