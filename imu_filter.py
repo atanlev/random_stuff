@@ -23,7 +23,7 @@ obs = 'get_imu_ang_v_local'
 
 
 overright_taps = True
-TAPS =  [ 0.598162, -0.324555,  0.362915, -0.636521]
+TAPS =  [ 0.656326, -0.372117,  0.656326]
 def delay(b, a):
     w, h = freqz(b, a, worN=512)
 
@@ -188,6 +188,8 @@ if __name__ == '__main__':
     if overright_taps:
         print('Using given taps')
         taps = TAPS
+        taps = torch.tensor(taps, dtype=torch.float32)
+        taps = taps/torch.norm(taps)
     filter_rt = RealTimeIIR(taps, a)
     filtered_real = RT_FIR(imu, filter_rt)
     filtered_sim = RT_FIR(imu, filter_rt, state='sim')
