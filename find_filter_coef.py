@@ -13,7 +13,7 @@ from torch_filter import RealTimeIIR
 DEFAULT_PATH = '/home/ethanl/data/mike-20250806_130228/happy_v3_1_22_07_25_7_/sim_data.pkl'
 DEFAULT_OBS = 'get_imu_ang_v_local'   # or 'get_lin_acc_local', etc.
 FS = 210.0
-MAX_TAPS = 9
+MAX_TAPS = 20
 ALPHA = 1.0
 BETA = 0.1
 DELTA = 0.0               # default; overridden by --delta
@@ -34,11 +34,20 @@ LEN_CHANGE_PROB = 0.1
 # -------------------------
 # Utilities
 # -------------------------
+from scipy.signal import resample_poly
+
+def resample_to_200hz(signal, orig_fs=30, target_fs=200):
+    up, down = 20, 3  # since 200/30 = 20/3
+    return torch.tensor(
+        resample_poly(signal.numpy(), up=up, down=down),
+        dtype=torch.float32
+    )
+
 def set_seed(s):
     np.random.seed(s)
     torch.manual_seed(s)
 
-def get_imu_data(data, sim_env, obs):
+def get_imu_data(data, sim_env, obs, orig_fs=30, target_fs=200):
     obs_range = data['observation_idx_dict']['actor'][obs]
     idx = list(range(obs_range[0], obs_range[1]))
     real_imu_tensor = data['real_obs'][obs]  # [T,3]
@@ -55,8 +64,15 @@ def get_imu_data(data, sim_env, obs):
     for j, axis in enumerate(['x','y','z']):
         r = real_imu_tensor[:, j]
         s = sim_imu_tensor[:, j]
-        imu['real'][axis] = r / (torch.norm(r) + 1e-12)
-        imu['sim'][axis]  = s / (torch.norm(s) + 1e-12)
+        r = r / (torch.norm(r) + 1e-12)
+        s = s / (torch.norm(s) + 1e-12)
+
+        # --- resample both to 200 Hz ---
+        r_up = resample_to_200hz(r, orig_fs, target_fs)
+        s_up = resample_to_200hz(s, orig_fs, target_fs)
+
+        imu['real'][axis] = r_up
+        imu['sim'][axis]  = s_up
     return imu
 
 def RT_FIR(imu, filter_rt, state='real', axis='x'):
@@ -70,24 +86,18 @@ def RT_FIR(imu, filter_rt, state='real', axis='x'):
 # --- Symmetry + normalization helpers ---
 
 def symmetrize(b):
-    """Force linear-phase symmetry: b[n] = b[M-n]. Works for even/odd lengths."""
     b = np.asarray(b, dtype=np.float64)
     if b.size == 0:
         return b
     return 0.5 * (b + b[::-1])
 
 def normalize_taps(b):
-    """
-    Enforce symmetry, then L2-normalize (energy = 1).
-    Mean-centering is removed to avoid unintentionally forcing DC notch.
-    """
     b = np.asarray(b, dtype=np.float64)
     if b.size == 0:
         return b
     b = symmetrize(b)
     norm = np.linalg.norm(b)
     if norm < 1e-12:
-        # fallback: symmetric 2-tap averager
         b = np.ones_like(b) / max(1, len(b))
         b = symmetrize(b)
         norm = np.linalg.norm(b)
@@ -96,7 +106,6 @@ def normalize_taps(b):
 def propose_neighbor(b, step_scale, allow_len_changes=True):
     b = np.asarray(b, dtype=np.float64).copy()
 
-    # Optional length change (kept symmetric automatically afterwards)
     if allow_len_changes and np.random.rand() < LEN_CHANGE_PROB:
         if len(b) < MAX_TAPS and np.random.rand() < 0.5:
             pos = np.random.randint(0, len(b)+1)
@@ -105,11 +114,9 @@ def propose_neighbor(b, step_scale, allow_len_changes=True):
             pos = np.random.randint(0, len(b))
             b = np.delete(b, pos)
 
-    # Random perturbation + re-symmetrize
     noise = np.random.normal(loc=0.0, scale=step_scale, size=len(b))
     b = b + noise
     b = symmetrize(b)
-
     return normalize_taps(b)
 
 def schedule(it, iters, start, end):
@@ -120,49 +127,59 @@ def l2(a, b):
     return float(np.linalg.norm(a - b))
 
 # -------------------------
-# Loss
+# Loss (fixed)
 # -------------------------
-def compute_loss(b_dict, imu, fs=FS):
+def compute_loss(b_dict, imu, sim_power=None, real_power=None):
     """
     b_dict = {'x': b_x, 'y': b_y, 'z': b_z} (any subset of axes allowed).
     Loss = ALPHA * time_L2 + BETA * freq_L2 + DELTA * power_penalty
-    - time_L2: ||filtered(real) - sim||_2
-    - freq_L2: || |FFT(filtered(real))| - |FFT(sim)| ||_2
-    - power_penalty: (RMS(filtered) - RMS(sim))^2  (per axis, summed)
+    power penalty is sum of squared RMS differences (per axis).
+    If sim_power/real_power provided (floats), use them as targets; else compute from data.
     """
     total_time, total_freq, power_pen = 0.0, 0.0, 0.0
 
     for axis, b in b_dict.items():
-        b = normalize_taps(b)  # ensure symmetry & norm before use
+        b = normalize_taps(b)
 
         real_t = imu['real'][axis].numpy()
         sim_t  = imu['sim'][axis].numpy()
 
-        # Causal RT filtering (same as your RealTimeIIR flow)
+        # Causal RT filtering
         filt = RealTimeIIR(b, [1.0])
         fr = RT_FIR(imu, filt, state='real', axis=axis)
+        fr_sim = RT_FIR(imu, filt, state='sim', axis=axis)
 
-        # time-domain L2
-        total_time += l2(fr, sim_t)
+        # time-domain L2 between filtered real and filtered sim
+        total_time += l2(fr, fr_sim)
 
         # frequency magnitude L2
         fr_f  = np.abs(rfft(fr))
-        sim_f = np.abs(rfft(sim_t))
+        sim_f = np.abs(rfft(fr_sim))
         total_freq += l2(fr_f, sim_f)
 
-        # improved power penalty: RMS (mean-square) difference squared
-        rms_fr  = np.mean(fr**2)
-        rms_sim = np.mean(sim_t**2)
-        power_pen += (rms_fr - rms_sim)**2
+        # RMS powers
+        rms_fr  = float(np.mean(fr**2))
+        rms_fsim = float(np.mean(fr_sim**2))
+
+        if sim_power is not None and real_power is not None:
+            # sim_power/real_power expected to be floats (per-axis averages across datasets)
+            target_sim_power = float(sim_power)
+            target_real_power = float(real_power)
+        else:
+            target_sim_power = float(np.mean(sim_t**2))
+            target_real_power = float(np.mean(real_t**2))
+
+        # improved power penalty: squared difference of RMS (use both real and sim targets)
+        # accumulate squared errors so penalty >= 0
+        power_pen += (rms_fr - target_real_power)**2 + (rms_fsim - target_sim_power)**2
 
     loss = ALPHA * total_time + BETA * total_freq + DELTA * power_pen
     return loss, total_time, total_freq
 
 # -------------------------
-# Main routine
+# Main routine (fixed SIM/REAL power computation order)
 # -------------------------
 def run_optimization(paths, obs, sim_env=0, init_len=4, set_taps=True):
-    # Load datasets
     imus = []
     for path in paths:
         with open(path, 'rb') as f:
@@ -170,24 +187,35 @@ def run_optimization(paths, obs, sim_env=0, init_len=4, set_taps=True):
         imu = get_imu_data(data, sim_env=sim_env, obs=obs)
         imus.append(imu)
 
-    # Init per-axis symmetric taps
     init_len = int(np.clip(init_len, 1, MAX_TAPS))
-    if set_taps and init_len == 4:
-        init_b = np.array([0.1961, 0.2436, 0.2436, 0.1961], dtype=np.float64)
+    if set_taps and init_len == 6:
+        init_b = np.array([-0.1099,  0.1301,  0.4302,  0.4302,  0.1301, -0.1099], dtype=np.float64)
     elif set_taps and init_len == 2:
         init_b = np.array([0.4502, 0.4502], dtype=np.float64)
     else:
-        init_b = np.ones(init_len, dtype=np.float64) / init_len  # moving average
+        init_b = np.ones(init_len, dtype=np.float64) / init_len
     init_b = normalize_taps(init_b)
 
     best_b = {axis: init_b.copy() for axis in ['x','y','z']}
 
-    # Initial axis-wise losses (averaged across datasets)
+    # First compute average SIM/REAL power per axis (floats)
+    SIM_POWER = {}
+    REAL_POWER = {}
+    for axis in ['x','y','z']:
+        sim_acc = 0.0
+        real_acc = 0.0
+        for imu in imus:
+            sim_acc += float(torch.mean(imu['sim'][axis]**2).item())
+            real_acc += float(torch.mean(imu['real'][axis]**2).item())
+        SIM_POWER[axis] = sim_acc / len(imus)
+        REAL_POWER[axis] = real_acc / len(imus)
+
+    # Then compute initial best_loss averaged across datasets using those powers
     best_loss = {}
     for axis in ['x','y','z']:
         acc = 0.0
         for imu in imus:
-            l, _, _ = compute_loss({axis: best_b[axis]}, imu)
+            l, _, _ = compute_loss({axis: best_b[axis]}, imu, SIM_POWER[axis], REAL_POWER[axis])
             acc += l
         best_loss[axis] = acc / len(imus)
 
@@ -198,10 +226,9 @@ def run_optimization(paths, obs, sim_env=0, init_len=4, set_taps=True):
 
         for axis in ['x','y','z']:
             cand_b = propose_neighbor(best_b[axis], step, allow_len_changes=ALLOW_LENGTH_CHANGES)
-
             acc = 0.0
             for imu in imus:
-                l, _, _ = compute_loss({axis: cand_b}, imu)
+                l, _, _ = compute_loss({axis: cand_b}, imu, SIM_POWER[axis], REAL_POWER[axis])
                 acc += l
             cand_loss = acc / len(imus)
 
@@ -232,9 +259,9 @@ def main():
     parser.add_argument("--paths", type=str, nargs='+', required=True,
                         help="One or more paths to sim_data.pkl files")
     parser.add_argument("--obs", type=str, default='get_imu_ang_v_local', help="Observation key")
-    parser.add_argument("--init_len", type=int, default=3, help="Initial number of taps (1..9)")
-    parser.add_argument("--set_taps", type=int, default=1, help="Use built-in symmetric seeds when length=2 or 4 (1/0)")
-    parser.add_argument("--iters", type=int, default=16000, help="Iterations")
+    parser.add_argument("--init_len", type=int, default=5, help="Initial number of taps (1..9)")
+    parser.add_argument("--set_taps", type=int, default=10, help="Use built-in symmetric seeds when length=2 or 4 (1/0)")
+    parser.add_argument("--iters", type=int, default=4000, help="Iterations")
     parser.add_argument("--alpha", type=float, default=1.0, help="Time-domain weight")
     parser.add_argument("--beta", type=float, default=0.2, help="Freq-domain weight")
     parser.add_argument("--delta", type=float, default=0.3, help="Power weight (RMS error)")

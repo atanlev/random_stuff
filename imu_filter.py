@@ -7,13 +7,11 @@ from scipy.fft import fft, fftfreq
 from scipy import signal
 import numpy as np
 from torch_filter import torch_filtfilt, RealTimeIIR
+from scipy.signal import resample_poly
 
-path = '/home/ethanl/data/mike-20250806_130228/happy_v3_1_22_07_25_7_/sim_data.pkl'
-# path = '/home/ethanl/data/neil-20250804_134921/develop_projects_happy_v3_1_29_07_25_8/sim_data.pkl'
-# path = '/home/ethanl/data/mike-20250806_142049/happy_v3_1_06_08_25_2_/sim_data.pkl'
-# path = '/home/ethanl/data/mike-20250805_153142/happy_v3_1_05_08_25_13_/sim_data.pkl'
-# path = '/home/ethanl/data/logs/mike-20250818_153221/happy_v3_1_07_08_25_6_/sim_data.pkl' #unfiltered
-# path = '/home/ethanl/data/logs/mike-20250818_154125/happy_v3_1_18_08_25_1_/sim_data.pkl' #fir
+# path = '/home/ethanl/data/logs/deby-20250901_115412/v3_1_28_08_25_3_/sim_data.pkl'
+path = '/home/ethanl/data/logs/deby-20250828_081942/v3_1_28_08_25_3_/sim_data.pkl'
+# path= '/home/ethanl/data/logs/deby-20250902_123032_w_fir_core/v3_1_28_08_25_3_/sim_data.pkl'
 
 obs = 'get_imu_ang_v_local'
 # obs = 'get_lin_acc_local'
@@ -22,8 +20,9 @@ obs = 'get_imu_ang_v_local'
 # obs = 'get_imu_ang_v_local_filtered_fir'
 
 
-overright_taps = True
-TAPS =  [ 0.656326, -0.372117,  0.656326]
+overright_taps = False
+# TAPS =  [-0.0436, -0.0428, -0.0396, -0.0338, -0.0258, -0.0156, -0.0039,  0.0089, 0.0220,  0.0348,  0.0464,  0.0562,  0.0637,  0.0684,  0.0700,  0.0684, 0.0637,  0.0562,  0.0464,  0.0348,  0.0220,  0.0089, -0.0039, -0.0156,-0.0258, -0.0338, -0.0396, -0.0428, -0.0436]
+TAPS = [0.0348, 0.0464, 0.0562, 0.0637, 0.0684, 0.0700, 0.0684, 0.0637, 0.0562,0.0464, 0.0348]
 def delay(b, a):
     w, h = freqz(b, a, worN=512)
 
@@ -35,33 +34,49 @@ def delay(b, a):
 
     return w, magnitude, phase, w_gd, group_delay
 
-def get_imu_data(data, sim_env, obs):
+def resample_to_200hz(signal, orig_fs=30, target_fs=200):
+    up, down = 20, 3  # since 200/30 = 20/3
+    return torch.tensor(
+        resample_poly(signal.numpy(), up=up, down=down),
+        dtype=torch.float32
+    )
+
+def get_imu_data(data, sim_env, obs, orig_fs=30, target_fs=200):
     obs_range = data['observation_idx_dict']['actor'][obs]
-    idx = list(range(obs_range[0],obs_range[1]))
-    real_imu_tensor = data['real_obs'][obs]
-    sim_imu_tensor = data['sim_obs'][0]['standing']['actor'][sim_env,idx].unsqueeze(0)
+    idx = list(range(obs_range[0], obs_range[1]))
+    real_imu_tensor = data['real_obs'][obs]  # [T,3]
+    sim_imu_tensor = data['sim_obs'][0]['standing']['actor'][sim_env, idx].unsqueeze(0)
     for i in range(1, len(data['sim_obs'])):
-        sim_imu_tensor = torch.cat([sim_imu_tensor,data['sim_obs'][i]['standing']['actor'][sim_env,idx].unsqueeze(0)], dim = 0)
+        sim_imu_tensor = torch.cat(
+            [sim_imu_tensor, data['sim_obs'][i]['standing']['actor'][sim_env, idx].unsqueeze(0)],
+            dim=0
+        )
+    real_imu_tensor = real_imu_tensor.cpu().float()
+    sim_imu_tensor = sim_imu_tensor.cpu().float()
 
-    real_imu_tensor = real_imu_tensor.cpu()
-    sim_imu_tensor = sim_imu_tensor.cpu()
-    temp = [real_imu_tensor, sim_imu_tensor]
-    #normalize and separate
     imu = {mode: {} for mode in ['sim', 'real']}
+    for j, axis in enumerate(['x','y','z']):
+        r = real_imu_tensor[:, j]
+        s = sim_imu_tensor[:, j]
+        r = r
+        s = s
 
-    for i, mode in enumerate(['sim', 'real']):
-        for j, axis in enumerate(['x','y','z']):
-            imu[mode][axis] = temp[i][:,j] / torch.norm(temp[i][:,j])
-    
+        # --- resample both to 200 Hz ---
+        r_up = resample_to_200hz(r, orig_fs, target_fs)
+        s_up = resample_to_200hz(s, orig_fs, target_fs)
+
+        imu['real'][axis] = r_up
+        imu['sim'][axis]  = s_up
     return imu
 
-def FIR_filter(imu,ripple=20, width=300, fs=1000, cutoff=125):
+
+def FIR_filter(imu,ripple=20, width=300, fs=1000, cutoff=125, pass_zero=False):
     numtaps, beta = kaiserord(ripple, width/(0.5*fs))
     taps = firwin(numtaps, cutoff,
                 window=('kaiser', beta),
                 scale=False,
                 fs=fs,
-                pass_zero=False)
+                pass_zero=pass_zero)
     taps = torch.tensor(taps, dtype=torch.float32)
     a = torch.tensor([1.0], dtype=torch.float32)
     filtered = {'x': None,'y': None,'z': None}
@@ -184,12 +199,11 @@ if __name__ == '__main__':
         data = pkl.load(f)
 
     imu = get_imu_data(data=data, sim_env=sim_env, obs=obs)
-    filtered, taps, a = FIR_filter(imu, ripple=8, width=6, fs=210, cutoff=[5, 50])
+    filtered_real, taps, a = FIR_filter(imu, ripple=20, width=3, fs=200, cutoff=[0, 4])
     if overright_taps:
         print('Using given taps')
         taps = TAPS
         taps = torch.tensor(taps, dtype=torch.float32)
-        taps = taps/torch.norm(taps)
     filter_rt = RealTimeIIR(taps, a)
     filtered_real = RT_FIR(imu, filter_rt)
     filtered_sim = RT_FIR(imu, filter_rt, state='sim')
