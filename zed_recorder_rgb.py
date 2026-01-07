@@ -1,15 +1,12 @@
 import pyzed.sl as sl
-import numpy as np
 import cv2
 import os
 from copy import copy
 
-# Create a ZED camera object
-zed = sl.Camera()
-
 # Set configuration parameters
+zed = sl.Camera()
 init_params = sl.InitParameters()
-init_params.camera_resolution = sl.RESOLUTION.HD720
+init_params.camera_resolution = sl.RESOLUTION.HD1080
 init_params.camera_fps = 30  # Set the frame rate
 
 # Open the camera
@@ -30,7 +27,7 @@ frame_height, frame_width = frame_shape[:2]
 
 # Define the codec and create a VideoWriter object
 downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-video_file_path = os.path.join(downloads_dir, "zed_video_output.mp4")
+video_file_path = os.path.join(downloads_dir, "zed_video_output_april.mp4")
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for .mp4 files
 out = cv2.VideoWriter(video_file_path, fourcc, 30.0, (frame_width, frame_height))
 
@@ -47,7 +44,7 @@ while True:
         frame = copy(image.get_data())
 
         # Write the frame to the video file
-        out.write(frame)
+        out.write(frame[..., :3])  # Ensure only 3 channels are written
 
         # Display the frame
         cv2.imshow("ZED Camera", frame)
