@@ -3,14 +3,13 @@ import numpy as np
 import torch
 import scipy.signal as signal
 import argparse
-import time
-
+import matplotlib.pyplot as plt
 # -------------------------
 # Config
 # -------------------------
 FS_ROBOT = 200.0   # Target Control Freq
 FS_IMU   = 30.0    # Source Sensor Freq
-CUTOFF   = 12.0    # Hz (Must be < Nyquist of source, i.e., < 15Hz)
+CUTOFF   = 30.0    # Hz (Must be < Nyquist of source, i.e., < 15Hz)
 FILTER_ORDER = 2   # Order 2 is a sweet spot for smoothing vs. delay
 
 # -------------------------
@@ -161,8 +160,90 @@ def calculate_kpis(filtered, target, raw, fs):
         "filt_roughness": filt_roughness,
         "delay_ms": delay_ms
     }
+import numpy as np
+from scipy import signal
 
-# -------------------------
+
+def analyze_filter_performance(filtered, target, raw, fs, cutoff_freq=10.0, plot=True):
+    """
+    Analyzes filter performance using Spectral Density to separate 
+    Signal (Tracking) from Noise (Real-world artifacts).
+    """
+    
+    # --- 1. Basic Time-Domain Metrics ---
+    # RMSE (Accuracy): Compare against the ideal Target (Sim)
+    raw_rmse = np.sqrt(np.mean((raw - target) ** 2))
+    filt_rmse = np.sqrt(np.mean((filtered - target) ** 2))
+    
+    # Delay Estimation: Compare Input (Raw) vs Output (Filtered)
+    corr = signal.correlate(raw - np.mean(raw), filtered - np.mean(filtered), mode='full')
+    lags = signal.correlation_lags(len(raw), len(filtered), mode='full')
+    lag_idx = lags[np.argmax(corr)]
+    delay_ms = (lag_idx / fs) * 1000.0
+
+    # --- 2. Spectral Distribution Analysis (Welch) ---
+    # We analyze the "Residuals" (The difference between Reality and Sim)
+    noise_signal_raw = raw - target
+    noise_signal_filt = filtered - target
+    
+    # Compute Power Spectral Density (PSD)
+    # nperseg: Length of each segment. Higher = more freq resolution, lower = smoother plot.
+    freqs, psd_raw = signal.welch(noise_signal_raw, fs, nperseg=1024)
+    _, psd_filt = signal.welch(noise_signal_filt, fs, nperseg=1024)
+    
+    # --- 3. Compute Suppression in the Noise Band ---
+    # We care about energy ABOVE the cutoff (Real-world noise range)
+    idx_cutoff = np.argmax(freqs >= cutoff_freq)
+    
+    energy_raw_high_freq = np.trapz(psd_raw[idx_cutoff:], freqs[idx_cutoff:])
+    energy_filt_high_freq = np.trapz(psd_filt[idx_cutoff:], freqs[idx_cutoff:])
+    
+    # Safety check for log10
+    energy_raw_high_freq = max(energy_raw_high_freq, 1e-12)
+    energy_filt_high_freq = max(energy_filt_high_freq, 1e-12)
+    
+    suppression_db = 10 * np.log10(energy_filt_high_freq / energy_raw_high_freq)
+
+    # --- 4. Plotting ---
+    if plot:
+        plt.figure(figsize=(10, 6))
+        
+        # Convert PSD to dB/Hz for standard plotting
+        psd_raw_db = 10 * np.log10(psd_raw + 1e-12)
+        psd_filt_db = 10 * np.log10(psd_filt + 1e-12)
+        
+        plt.plot(freqs, psd_raw_db, label='Raw Residual (Input Noise)', color='grey', alpha=0.7)
+        plt.plot(freqs, psd_filt_db, label='Filtered Residual (Output Noise)', color='red', linewidth=2)
+        
+        # Draw the Cutoff Line
+        plt.axvline(x=cutoff_freq, color='k', linestyle='--', label=f'Cutoff ({cutoff_freq} Hz)')
+        
+        # Shade the region being analyzed
+        plt.fill_between(freqs[idx_cutoff:], -100, psd_raw_db[idx_cutoff:], color='gray', alpha=0.1)
+        
+        plt.title(f"Spectral Analysis of Error (Noise Suppression: {suppression_db:.2f} dB)")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Power Spectral Density (dB/Hz)")
+        plt.legend()
+        plt.grid(True, which='both', linestyle='--', alpha=0.6)
+        plt.xlim(0, fs/2) # Show up to Nyquist
+        
+        # Optional: Zoom in on y-axis if noise floor is low
+        plt.ylim(max(np.min(psd_filt_db), -120), np.max(psd_raw_db) + 10)
+        
+        plt.tight_layout()
+        plt.show()
+
+    print(f"--- Analysis Results ---")
+    print(f"RMSE Improvement: {(raw_rmse - filt_rmse)/raw_rmse*100:.1f}%")
+    print(f"Added Delay:      {delay_ms:.2f} ms")
+    print(f"Noise Suppression:{suppression_db:.2f} dB (Energy > {cutoff_freq}Hz)")
+    
+    return {
+        "rmse_imp": raw_rmse - filt_rmse,
+        "delay_ms": delay_ms,
+        "suppression_db": suppression_db
+    }# -------------------------
 # Main Execution
 # -------------------------
 def main():
@@ -198,6 +279,8 @@ def main():
             
             # Evaluate
             kpis = calculate_kpis(filtered=filtered_signal, target=sim_ref, raw=raw_zoh, fs=FS_ROBOT)
+            analyze_filter_performance(filtered=filtered_signal, target=sim_ref, raw=raw_zoh, fs=FS_ROBOT, cutoff_freq=CUTOFF)
+
             rmse = kpis["filt_rmse"]
             rough = kpis["filt_roughness"]
             delay = kpis["delay_ms"]
