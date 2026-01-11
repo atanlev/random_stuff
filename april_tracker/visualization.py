@@ -8,71 +8,151 @@ from typing import Optional
 from scipy.spatial.transform import Rotation
 
 import os
-os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
+import sys
+
+# Suppress Qt threading warnings
+os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false;qt.*=false'
+os.environ['QT_DEBUG_PLUGINS'] = '0'
+
+# Redirect stderr temporarily during cv2 operations to suppress Qt warnings
+class SuppressQtWarnings:
+    def __enter__(self):
+        self._stderr = sys.stderr
+        sys.stderr = open(os.devnull, 'w')
+        return self
+
+    def __exit__(self, *args):
+        sys.stderr.close()
+        sys.stderr = self._stderr
 
 from .tracker_data_types import FrameResult
 from .tracker import AprilTagTracker
+from .config import APRILTAG_TO_BASELINK_OFFSET
+
+
+def apply_tag_to_baselink_offset(april_pos: np.ndarray, april_rot: np.ndarray) -> np.ndarray:
+    """Transform AprilTag position to base_link position using the known offset."""
+    offset_in_ref = april_rot @ APRILTAG_TO_BASELINK_OFFSET
+    return april_pos - offset_in_ref
 
 def plot_comparison(comparison: dict):
-    """Plot AprilTag vs odometry position comparison."""
+    """Plot AprilTag vs odometry position and orientation comparison."""
     april_pos = comparison['april_positions']
     odom_pos = comparison['odom_positions']
+    april_quats = comparison['april_quats_aligned']
+    odom_quats = comparison['odom_quats']
     timestamps = comparison['timestamps']
-    errors = comparison['pos_error_norms']
+    pos_errors = comparison['pos_error_norms']
 
     # Normalize timestamps to start at 0
     t = timestamps - timestamps[0]
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    # Convert quaternions to euler angles (in degrees)
+    april_euler = np.array([Rotation.from_quat(q).as_euler('xyz', degrees=True) for q in april_quats])
+    odom_euler = np.array([Rotation.from_quat(q).as_euler('xyz', degrees=True) for q in odom_quats])
+
+    # Compute euler angle errors (handle wraparound at +/-180)
+    euler_errors = april_euler - odom_euler
+    # Wrap to [-180, 180]
+    euler_errors = np.mod(euler_errors + 180, 360) - 180
+
+    # Position plots
+    fig1, axes1 = plt.subplots(2, 2, figsize=(12, 10))
+    fig1.suptitle('Position Comparison', fontsize=14)
 
     # X position over time
-    axes[0, 0].plot(t, april_pos[:, 0], 'b-', label='AprilTag', alpha=0.7)
-    axes[0, 0].plot(t, odom_pos[:, 0], 'r--', label='Odometry', alpha=0.7)
-    axes[0, 0].set_xlabel('Time (s)')
-    axes[0, 0].set_ylabel('X (m)')
-    axes[0, 0].set_title('X Position')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
+    axes1[0, 0].plot(t, april_pos[:, 0], 'b-', label='AprilTag', alpha=0.7)
+    axes1[0, 0].plot(t, odom_pos[:, 0], 'r--', label='Odometry', alpha=0.7)
+    axes1[0, 0].set_xlabel('Time (s)')
+    axes1[0, 0].set_ylabel('X (m)')
+    axes1[0, 0].set_title('X Position')
+    axes1[0, 0].legend()
+    axes1[0, 0].grid(True)
 
     # Y position over time
-    axes[0, 1].plot(t, april_pos[:, 1], 'b-', label='AprilTag', alpha=0.7)
-    axes[0, 1].plot(t, odom_pos[:, 1], 'r--', label='Odometry', alpha=0.7)
-    axes[0, 1].set_xlabel('Time (s)')
-    axes[0, 1].set_ylabel('Y (m)')
-    axes[0, 1].set_title('Y Position')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
+    axes1[0, 1].plot(t, april_pos[:, 1], 'b-', label='AprilTag', alpha=0.7)
+    axes1[0, 1].plot(t, odom_pos[:, 1], 'r--', label='Odometry', alpha=0.7)
+    axes1[0, 1].set_xlabel('Time (s)')
+    axes1[0, 1].set_ylabel('Y (m)')
+    axes1[0, 1].set_title('Y Position')
+    axes1[0, 1].legend()
+    axes1[0, 1].grid(True)
 
     # Z position over time
-    axes[1, 0].plot(t, april_pos[:, 2], 'b-', label='AprilTag', alpha=0.7)
-    axes[1, 0].plot(t, odom_pos[:, 2], 'r--', label='Odometry', alpha=0.7)
-    axes[1, 0].set_xlabel('Time (s)')
-    axes[1, 0].set_ylabel('Z (m)')
-    axes[1, 0].set_title('Z Position')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True)
+    axes1[1, 0].plot(t, april_pos[:, 2], 'b-', label='AprilTag', alpha=0.7)
+    axes1[1, 0].plot(t, odom_pos[:, 2], 'r--', label='Odometry', alpha=0.7)
+    axes1[1, 0].set_xlabel('Time (s)')
+    axes1[1, 0].set_ylabel('Z (m)')
+    axes1[1, 0].set_title('Z Position')
+    axes1[1, 0].legend()
+    axes1[1, 0].grid(True)
 
     # Position error over time
-    axes[1, 1].plot(t, errors, 'g-', alpha=0.7)
-    axes[1, 1].set_xlabel('Time (s)')
-    axes[1, 1].set_ylabel('Error (m)')
-    axes[1, 1].set_title(f'Position Error (mean={np.mean(errors):.4f}m)')
-    axes[1, 1].grid(True)
+    axes1[1, 1].plot(t, pos_errors * 100, 'g-', alpha=0.7)  # Convert to cm
+    axes1[1, 1].set_xlabel('Time (s)')
+    axes1[1, 1].set_ylabel('Error (cm)')
+    axes1[1, 1].set_title(f'Position Error (mean={np.mean(pos_errors)*100:.1f}cm)')
+    axes1[1, 1].grid(True)
+
+    plt.tight_layout()
+
+    # Orientation plots
+    fig2, axes2 = plt.subplots(2, 2, figsize=(12, 10))
+    fig2.suptitle('Orientation Comparison (Euler XYZ)', fontsize=14)
+
+    # Roll (X rotation) over time
+    axes2[0, 0].plot(t, april_euler[:, 0], 'b-', label='AprilTag', alpha=0.7)
+    axes2[0, 0].plot(t, odom_euler[:, 0], 'r--', label='Odometry', alpha=0.7)
+    axes2[0, 0].set_xlabel('Time (s)')
+    axes2[0, 0].set_ylabel('Roll (deg)')
+    axes2[0, 0].set_title('Roll (X rotation)')
+    axes2[0, 0].legend()
+    axes2[0, 0].grid(True)
+
+    # Pitch (Y rotation) over time
+    axes2[0, 1].plot(t, april_euler[:, 1], 'b-', label='AprilTag', alpha=0.7)
+    axes2[0, 1].plot(t, odom_euler[:, 1], 'r--', label='Odometry', alpha=0.7)
+    axes2[0, 1].set_xlabel('Time (s)')
+    axes2[0, 1].set_ylabel('Pitch (deg)')
+    axes2[0, 1].set_title('Pitch (Y rotation)')
+    axes2[0, 1].legend()
+    axes2[0, 1].grid(True)
+
+    # Yaw (Z rotation) over time
+    axes2[1, 0].plot(t, april_euler[:, 2], 'b-', label='AprilTag', alpha=0.7)
+    axes2[1, 0].plot(t, odom_euler[:, 2], 'r--', label='Odometry', alpha=0.7)
+    axes2[1, 0].set_xlabel('Time (s)')
+    axes2[1, 0].set_ylabel('Yaw (deg)')
+    axes2[1, 0].set_title('Yaw (Z rotation)')
+    axes2[1, 0].legend()
+    axes2[1, 0].grid(True)
+
+    # Euler angle errors over time
+    axes2[1, 1].plot(t, euler_errors[:, 0], 'r-', label='Roll err', alpha=0.7)
+    axes2[1, 1].plot(t, euler_errors[:, 1], 'g-', label='Pitch err', alpha=0.7)
+    axes2[1, 1].plot(t, euler_errors[:, 2], 'b-', label='Yaw err', alpha=0.7)
+    axes2[1, 1].set_xlabel('Time (s)')
+    axes2[1, 1].set_ylabel('Error (deg)')
+    axes2[1, 1].set_title(f'Euler Angle Errors (RMS: R={np.sqrt(np.mean(euler_errors[:, 0]**2)):.1f}, '
+                          f'P={np.sqrt(np.mean(euler_errors[:, 1]**2)):.1f}, '
+                          f'Y={np.sqrt(np.mean(euler_errors[:, 2]**2)):.1f} deg)')
+    axes2[1, 1].legend()
+    axes2[1, 1].grid(True)
 
     plt.tight_layout()
 
     # 2D trajectory plot (X-Y plane)
-    fig2, ax2 = plt.subplots(figsize=(8, 8))
-    ax2.plot(april_pos[:, 0], april_pos[:, 1], 'b-', label='AprilTag', alpha=0.7)
-    ax2.plot(odom_pos[:, 0], odom_pos[:, 1], 'r--', label='Odometry', alpha=0.7)
-    ax2.scatter(april_pos[0, 0], april_pos[0, 1], c='blue', s=100, marker='o', zorder=5)
-    ax2.scatter(odom_pos[0, 0], odom_pos[0, 1], c='red', s=100, marker='o', zorder=5)
-    ax2.set_xlabel('X (m)')
-    ax2.set_ylabel('Y (m)')
-    ax2.set_title('XY Trajectory Comparison')
-    ax2.legend()
-    ax2.grid(True)
-    ax2.axis('equal')
+    fig3, ax3 = plt.subplots(figsize=(8, 8))
+    ax3.plot(april_pos[:, 0], april_pos[:, 1], 'b-', label='AprilTag', alpha=0.7)
+    ax3.plot(odom_pos[:, 0], odom_pos[:, 1], 'r--', label='Odometry', alpha=0.7)
+    ax3.scatter(april_pos[0, 0], april_pos[0, 1], c='blue', s=100, marker='o', zorder=5)
+    ax3.scatter(odom_pos[0, 0], odom_pos[0, 1], c='red', s=100, marker='o', zorder=5)
+    ax3.set_xlabel('X (m)')
+    ax3.set_ylabel('Y (m)')
+    ax3.set_title('XY Trajectory Comparison')
+    ax3.legend()
+    ax3.grid(True)
+    ax3.axis('equal')
 
     plt.show()
 
@@ -121,8 +201,10 @@ def visualize_on_frames(
         base_link_pose = result.poses.get('base_link')
 
         if base_link_pose is not None and odom is not None:
-            # AprilTag raw position (in reference frame)
-            april_raw = base_link_pose.position
+            # Apply offset to get base_link position from AprilTag position
+            april_raw = apply_tag_to_baselink_offset(
+                base_link_pose.position, base_link_pose.rotation
+            )
 
             # Transform odom position back to AprilTag reference frame
             odom_pos = odom['position']
@@ -131,7 +213,7 @@ def visualize_on_frames(
             # Project both to image using tracker's reference pose
             ref_pose = tracker.reference_pose
 
-            # AprilTag position in camera frame
+            # Base_link position (from AprilTag with offset) in camera frame
             april_camera = ref_pose.rotation @ april_raw + ref_pose.position
             # Odom position in camera frame
             odom_camera = ref_pose.rotation @ odom_in_april_frame + ref_pose.position
@@ -189,9 +271,9 @@ def visualize_on_frames(
                 cv2.circle(frame, (odom_x, odom_y), 12, (0, 0, 255), -1)
                 cv2.circle(frame, (odom_x, odom_y), 14, (0, 0, 0), 2)
 
-                # Compute and display errors
+                # Compute and display errors (XYZ)
                 april_aligned = scale * (R @ april_raw) + t
-                pos_error = np.linalg.norm(april_aligned[:2] - odom_pos[:2]) * 100  # cm
+                pos_error = np.linalg.norm(april_aligned - odom_pos) * 100  # cm
 
                 # Compute angle error
                 r_diff = odom_rot.inv() * april_rot_aligned
@@ -232,9 +314,10 @@ def visualize_on_frames(
         if writer:
             writer.write(frame)
 
-        cv2.imshow('AprilTag vs Odometry', frame)
+        with SuppressQtWarnings():
+            cv2.imshow('AprilTag vs Odometry', frame)
+            key = cv2.waitKey(1 if not paused else 0) & 0xFF
 
-        key = cv2.waitKey(1 if not paused else 0) & 0xFF
         if key == ord('q'):
             break
         elif key == ord(' '):
@@ -246,4 +329,5 @@ def visualize_on_frames(
         writer.release()
         print(f"Saved visualization video to: {output_path}")
 
-    cv2.destroyAllWindows()
+    with SuppressQtWarnings():
+        cv2.destroyAllWindows()

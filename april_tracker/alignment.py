@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+from scipy.interpolate import interp1d
 
 
 def compute_alignment_transform(
@@ -55,9 +56,9 @@ def compute_alignment_transform(
         # Compute translation
         t = odom_mean - scale * (R @ april_mean)
 
-        # Compute residuals for all points (XY only, Z is constant in odom)
+        # Compute residuals for all points (XYZ)
         april_transformed = scale * (R @ april_positions.T).T + t
-        residuals = np.linalg.norm(april_transformed[:, :2] - odom_positions[:, :2], axis=1)
+        residuals = np.linalg.norm(april_transformed - odom_positions, axis=1)
 
         # Update inlier mask
         new_inlier_mask = residuals < outlier_threshold
@@ -106,3 +107,113 @@ def compute_rotation_alignment(
     mean_quat = mean_quat / np.linalg.norm(mean_quat)  # normalize
 
     return Rotation.from_quat(mean_quat)
+
+
+def find_time_offset(
+    april_timestamps: np.ndarray,
+    april_positions: np.ndarray,
+    odom_timestamps: np.ndarray,
+    odom_positions: np.ndarray,
+    search_range_ms: float = 100.0,
+    step_ms: float = 2.0,
+) -> tuple[float, float]:
+    """
+    Find optimal time offset between AprilTag and odometry using cross-correlation.
+
+    The odometry timestamp is when the TF was requested, but the actual pose
+    corresponds to a point slightly in the past. We find the offset that minimizes
+    position error after applying Kabsch alignment.
+
+    Args:
+        april_timestamps: Timestamps for AprilTag positions
+        april_positions: AprilTag positions (Nx3)
+        odom_timestamps: Timestamps for odometry positions
+        odom_positions: Odometry positions (Mx3)
+        search_range_ms: Search range in milliseconds (searches +/- this range)
+        step_ms: Step size in milliseconds
+
+    Returns:
+        best_offset_s: Optimal offset in seconds (positive = odom is delayed)
+        min_error: Mean position error at optimal offset
+    """
+    # Convert to seconds
+    search_range_s = search_range_ms / 1000.0
+    step_s = step_ms / 1000.0
+
+    # Create interpolator for odometry positions
+    odom_interp_x = interp1d(odom_timestamps, odom_positions[:, 0],
+                              kind='linear', bounds_error=False, fill_value=np.nan)
+    odom_interp_y = interp1d(odom_timestamps, odom_positions[:, 1],
+                              kind='linear', bounds_error=False, fill_value=np.nan)
+    odom_interp_z = interp1d(odom_timestamps, odom_positions[:, 2],
+                              kind='linear', bounds_error=False, fill_value=np.nan)
+
+    offsets = np.arange(-search_range_s, search_range_s + step_s, step_s)
+    errors = []
+
+    for offset in offsets:
+        # Shift april timestamps by offset (if odom is delayed, we look earlier)
+        shifted_timestamps = april_timestamps - offset
+
+        # Interpolate odometry at shifted timestamps
+        odom_x = odom_interp_x(shifted_timestamps)
+        odom_y = odom_interp_y(shifted_timestamps)
+        odom_z = odom_interp_z(shifted_timestamps)
+
+        # Stack and find valid (non-nan) points
+        odom_interp = np.column_stack([odom_x, odom_y, odom_z])
+        valid_mask = ~np.isnan(odom_interp).any(axis=1)
+
+        if np.sum(valid_mask) < 10:
+            errors.append(np.inf)
+            continue
+
+        april_valid = april_positions[valid_mask]
+        odom_valid = odom_interp[valid_mask]
+
+        # Use Kabsch algorithm to align, then compute residuals
+        # This properly handles rotation between coordinate frames
+        april_mean = np.mean(april_valid, axis=0)
+        odom_mean = np.mean(odom_valid, axis=0)
+
+        april_centered = april_valid - april_mean
+        odom_centered = odom_valid - odom_mean
+
+        # SVD for rotation
+        H = april_centered.T @ odom_centered
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+
+        # Compute scale
+        april_rotated = (R @ april_centered.T).T
+        scale = np.linalg.norm(odom_centered) / (np.linalg.norm(april_rotated) + 1e-10)
+
+        # Transform april to odom frame
+        t = odom_mean - scale * (R @ april_mean)
+        april_transformed = scale * (R @ april_valid.T).T + t
+
+        # Compute residuals
+        residuals = np.linalg.norm(april_transformed - odom_valid, axis=1)
+        mean_error = np.mean(residuals)
+        errors.append(mean_error)
+
+    errors = np.array(errors)
+    best_idx = np.argmin(errors)
+    best_offset_s = offsets[best_idx]
+    min_error = errors[best_idx]
+
+    # Print a few sample offsets to show the error landscape
+    sample_offsets = [0, -50, -100, -150, -200, 50, 100]
+    print("  Time offset search results:")
+    for sample_ms in sample_offsets:
+        sample_s = sample_ms / 1000.0
+        idx = np.argmin(np.abs(offsets - sample_s))
+        if idx < len(errors) and not np.isinf(errors[idx]):
+            print(f"    {sample_ms:+4d}ms: {errors[idx]:.4f}m")
+
+    if best_offset_s > 0:
+        raise ValueError(f"Best offset is positive: {best_offset_s * 1000:.1f} ms (odom delayed)")
+    return best_offset_s, min_error
