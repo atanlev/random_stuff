@@ -1,6 +1,8 @@
 import pyzed.sl as sl
 import cv2
 import os
+import pickle
+import time
 from copy import copy
 
 # Set configuration parameters
@@ -20,18 +22,14 @@ runtime_parameters = sl.RuntimeParameters()
 # Prepare a single image container
 image = sl.Mat()
 
-# Get the dimensions of the frame
-zed.retrieve_image(image, sl.VIEW.LEFT)
-frame_shape = image.get_data().shape
-frame_height, frame_width = frame_shape[:2]
+# List to store frames with timestamps
+frames_data = []
 
-# Define the codec and create a VideoWriter object
+# Output file path
 downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-video_file_path = os.path.join(downloads_dir, "zed_video_output_april.mp4")
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for .mp4 files
-out = cv2.VideoWriter(video_file_path, fourcc, 30.0, (frame_width, frame_height))
+pickle_file_path = os.path.join(downloads_dir, "zed_frames.pkl")
 
-print("Recording video, press 'q' to stop...")
+print("Recording frames, press 'q' to stop...")
 
 while True:
 
@@ -39,12 +37,18 @@ while True:
     if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
         # Retrieve the left image
         zed.retrieve_image(image, sl.VIEW.LEFT)
-        
+
+        # Get UTC timestamp
+        timestamp = time.time()
+
         # Convert to NumPy array
         frame = copy(image.get_data())
 
-        # Write the frame to the video file
-        out.write(frame[..., :3])  # Ensure only 3 channels are written
+        # Store frame with timestamp
+        frames_data.append({
+            'timestamp': timestamp,
+            'frame': frame[..., :3]  # Only store 3 channels (RGB)
+        })
 
         # Display the frame
         cv2.imshow("ZED Camera", frame)
@@ -53,9 +57,13 @@ while True:
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-# Release the camera and video writer
+# Release the camera
 zed.close()
-out.release()
 cv2.destroyAllWindows()
 
-print(f"Captured video and saved to {video_file_path}")
+# Save frames with timestamps to pickle file
+print(f"Saving {len(frames_data)} frames to pickle file...")
+with open(pickle_file_path, 'wb') as f:
+    pickle.dump(frames_data, f)
+
+print(f"Captured {len(frames_data)} frames and saved to {pickle_file_path}")
