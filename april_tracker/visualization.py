@@ -7,9 +7,11 @@ import matplotlib.pyplot as plt
 from typing import Optional
 from scipy.spatial.transform import Rotation
 
-from .data_types import FrameResult
-from .tracker import AprilTagTracker
+import os
+os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
 
+from .tracker_data_types import FrameResult
+from .tracker import AprilTagTracker
 
 def plot_comparison(comparison: dict):
     """Plot AprilTag vs odometry position comparison."""

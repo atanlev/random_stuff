@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .data_types import RigidBodyConfig
+from .tracker_data_types import RigidBodyConfig
 from .tracker import AprilTagTracker
 
 

@@ -6,7 +6,7 @@ import numpy as np
 from typing import Optional
 from pupil_apriltags import Detector
 
-from .data_types import RigidBodyConfig, Pose, FrameResult
+from .tracker_data_types import RigidBodyConfig, Pose, FrameResult
 
 
 class AprilTagTracker:

@@ -1,5 +1,5 @@
 """Main entry point for the AprilTag tracker package."""
-from .io import load_zed_frames, load_walk_log
+from .tracker_io import load_zed_frames, load_walk_log
 from .config import create_tracker
 from .processing import process_frames, compare_positions
 from .visualization import plot_comparison, visualize_on_frames
