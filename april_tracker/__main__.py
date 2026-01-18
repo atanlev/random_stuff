@@ -2,7 +2,7 @@
 import argparse
 
 from .tracker_io import load_zed_frames, load_walk_log
-from .config import create_tracker, AUTO_TIME_OFFSET, ZED_FRAMES_PATH, WALK_LOG_PATH
+from .config import create_tracker, AUTO_TIME_OFFSET, ZED_FRAMES_PATH, WALK_LOG_PATH, ODOM_FRAME
 from .processing import process_frames, compare_positions
 from .visualization import plot_comparison, visualize_on_frames
 
@@ -20,7 +20,10 @@ def main():
 
     print("Loading data...")
     zed_frames = load_zed_frames(zed_frames_path)
-    walk_log = load_walk_log(walk_log_path)
+    walk_log = load_walk_log(walk_log_path, frame_filter=ODOM_FRAME)
+
+    if ODOM_FRAME is not None:
+        print(f"Filtered odometry to frame: {ODOM_FRAME}")
 
     print(f"Loaded {len(zed_frames)} frames, {len(walk_log)} odometry entries")
     print(f"Frame timestamps: {zed_frames[0]['timestamp']:.3f} - {zed_frames[-1]['timestamp']:.3f}")

@@ -11,7 +11,9 @@ from .tracker_data_types import RigidBodyConfig, Pose, FrameResult
 
 class AprilTagTracker:
     """
-    Tracks rigid bodies using AprilTags with base_link at frame 0 as reference.
+    Tracks rigid bodies using AprilTags in robot coordinate frame.
+    Poses are returned in ROS-style coordinates (X=forward, Y=left, Z=up)
+    for direct transformation to odometry frame.
     """
 
     def __init__(
@@ -37,7 +39,6 @@ class AprilTagTracker:
         self.tag_sizes = {rb.tag_id: rb.tag_size for rb in rigid_bodies}
 
         self.base_link_tag_id: Optional[int] = None
-        self.reference_pose: Optional[Pose] = None
 
         for rb in rigid_bodies:
             if rb.name == "base_link":
@@ -45,7 +46,14 @@ class AprilTagTracker:
                 break
 
     def _get_tag_pose(self, detection, tag_size: float) -> Pose:
-        """Extract pose from a detection using solvePnP."""
+        """Extract pose from a detection using solvePnP, converted to robot frame.
+
+        OpenCV camera frame: X=right, Y=down, Z=forward
+        Robot frame (ROS): X=forward, Y=left, Z=up
+
+        Note: The rotation alignment (to match odometry) is computed automatically
+        from stationary frames in processing.py, not hardcoded here.
+        """
         half_size = tag_size / 2.0
         object_points = np.array([
             [-half_size,  half_size, 0],
@@ -67,25 +75,32 @@ class AprilTagTracker:
         if not success:
             raise ValueError(f"solvePnP failed for tag {detection.tag_id}")
 
-        R, _ = cv2.Rodrigues(rvec)
-        t = tvec.flatten()
+        R_camera, _ = cv2.Rodrigues(rvec)
+        t_camera = tvec.flatten()
 
-        return Pose(position=t, rotation=R)
+        # Transform from camera frame to robot frame
+        # Camera: X=right, Y=down, Z=forward
+        # Robot:  X=forward, Y=left, Z=up
+        #
+        # Mapping:
+        # Robot X (forward) <- Camera Z (forward)
+        # Robot Y (left) <- -Camera X (right)
+        # Robot Z (up) <- -Camera Y (down)
+        R_cam_to_robot = np.array([
+            [0,  0,  1],   # Robot X from Camera Z (forward)
+            [-1, 0,  0],   # Robot Y from -Camera X (right->left)
+            [0, -1,  0],   # Robot Z from -Camera Y (down->up)
+        ])
 
-    def _transform_to_reference(self, pose: Pose) -> Pose:
-        if self.reference_pose is None:
-            raise ValueError("Reference pose not set.")
+        # Apply coordinate transform
+        t_robot = R_cam_to_robot @ t_camera
+        # Similarity transform for rotation basis change
+        R_robot = R_cam_to_robot @ R_camera @ R_cam_to_robot.T
 
-        R_ref_inv = self.reference_pose.rotation.T
-        t_ref = self.reference_pose.position
-
-        pos_in_ref = R_ref_inv @ (pose.position - t_ref)
-        rot_in_ref = R_ref_inv @ pose.rotation
-
-        return Pose(position=pos_in_ref, rotation=rot_in_ref)
+        return Pose(position=t_robot, rotation=R_robot)
 
     def set_reference_from_frame(self, frame: np.ndarray) -> bool:
-        """Set reference frame using base_link pose from first frame."""
+        """Check that base_link tag is visible in first frame (for validation)."""
         if self.base_link_tag_id is None:
             raise ValueError("No base_link rigid body configured")
 
@@ -97,25 +112,15 @@ class AprilTagTracker:
             print("Error: base_link AprilTag not visible in reference frame")
             return False
 
-        base_link_detection = detection_by_id[self.base_link_tag_id]
-        self.reference_pose = self._get_tag_pose(
-            base_link_detection,
-            self.tag_sizes[self.base_link_tag_id]
-        )
-
-        print(f"Reference set to base_link at frame 0: pos={self.reference_pose.position}")
+        print(f"base_link AprilTag detected in first frame")
         return True
 
     def process_frame(self, frame: np.ndarray, frame_idx: int, timestamp_utc: float) -> FrameResult:
-        """Process a single frame and return poses for all detected rigid bodies."""
+        """Process a single frame and return poses in camera frame for all detected rigid bodies."""
         result = FrameResult(frame_idx=frame_idx, timestamp_utc=timestamp_utc)
 
         for rb in self.rigid_bodies.values():
             result.poses[rb.name] = None
-
-        if self.reference_pose is None:
-            print("Warning: Reference pose not set, returning empty result")
-            return result
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         detections = self.detector.detect(gray)
@@ -125,7 +130,7 @@ class AprilTagTracker:
             if tag_id in detection_by_id:
                 detection = detection_by_id[tag_id]
                 pose_camera = self._get_tag_pose(detection, self.tag_sizes[tag_id])
-                pose_ref = self._transform_to_reference(pose_camera)
-                result.poses[rb.name] = pose_ref
+                # Return pose in camera frame (no reference transform)
+                result.poses[rb.name] = pose_camera
 
         return result

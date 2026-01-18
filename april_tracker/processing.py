@@ -39,6 +39,7 @@ def process_frames(
 ) -> tuple[list[FrameResult], list[dict], list[dict], np.ndarray, float, np.ndarray, Rotation, float]:
     """
     Process frames from zed_frames.pkl that overlap with walk_log odometry.
+    Computes direct transformation from camera frame to odometry frame.
     Stops when frames go beyond odometry time range.
 
     Args:
@@ -48,12 +49,12 @@ def process_frames(
         time_offset_s: Optional time offset in seconds. If None, auto-detected.
 
     Returns:
-        april_results: AprilTag tracking results for each frame
-        matched_odom: Corresponding odometry data for each frame
+        april_results: AprilTag tracking results in camera frame for each frame
+        matched_odom: Corresponding odometry data (absolute positions) for each frame
         frames_used: The subset of zed_frames that were processed
-        R: Rotation matrix to align AprilTag positions to odometry frame
+        R: Rotation matrix to transform camera frame to odometry frame
         scale: Scale factor
-        t: Translation vector
+        t: Translation vector (camera_to_odom: odom_pos = scale * R @ camera_pos + t)
         R_rot_align: Rotation to align AprilTag orientations to odometry
         time_offset_s: The time offset used (auto-detected or provided)
     """
@@ -111,10 +112,8 @@ def process_frames(
             base_link_pose = result.poses.get('base_link')
             if base_link_pose is not None:
                 april_timestamps_for_offset.append(frame_data['timestamp'])
-                baselink_pos = apply_tag_to_baselink_offset(
-                    base_link_pose.position, base_link_pose.rotation
-                )
-                april_positions_for_offset.append(baselink_pos)
+                # Use raw AprilTag position for time offset detection
+                april_positions_for_offset.append(base_link_pose.position)
 
         if len(april_timestamps_for_offset) >= 20:
             april_timestamps_arr = np.array(april_timestamps_for_offset)
@@ -139,18 +138,8 @@ def process_frames(
     # Second pass: match odometry with corrected timestamps
     print(f"\nMatching odometry with time offset correction...")
 
-    # Get reference odometry at corrected timestamp
-    ref_timestamp = zed_frames[ref_frame_idx]['timestamp'] - time_offset_s
-    ref_odom = find_closest_odom(ref_timestamp, walk_log)
-    if ref_odom is None:
-        # Fall back to finding reference without offset correction
-        ref_timestamp = zed_frames[ref_frame_idx]['timestamp']
-        ref_odom = find_closest_odom(ref_timestamp, walk_log)
-        print(f"  Warning: corrected ref timestamp outside odom range, using uncorrected")
-    ref_odom_pos = np.array([ref_odom['x'], ref_odom['y'], ref_odom['z']])
-
-    print(f"Reference odometry position: {ref_odom_pos}")
-
+    # Match odometry without computing relative positions
+    # We'll compute the direct camera-to-odom transform instead
     matched_odom = []
     for frame_data in frames_used:
         # Apply time offset: if odom is delayed, we look at earlier odom
@@ -160,13 +149,13 @@ def process_frames(
         if odom:
             odom_pos = np.array([odom['x'], odom['y'], odom['z']])
             odom_quat = np.array([odom['qx'], odom['qy'], odom['qz'], odom['qw']])
-            relative_odom = {
+            matched_odom_entry = {
                 'timestamp_utc': odom['timestamp_utc'],
-                'position': odom_pos - ref_odom_pos,
+                'position': odom_pos,  # Absolute position in odometry frame
                 'quaternion': odom_quat,
                 'time_diff': abs(odom['timestamp_utc'] - corrected_timestamp),
             }
-            matched_odom.append(relative_odom)
+            matched_odom.append(matched_odom_entry)
         else:
             matched_odom.append(None)
 
@@ -203,11 +192,9 @@ def process_frames(
             if dt > 0:
                 velocity = np.linalg.norm(odom_pos[:2] - prev_odom_pos[:2]) / dt
                 if velocity < stationary_threshold:
-                    # Apply offset to get base_link position from AprilTag position
-                    baselink_pos = apply_tag_to_baselink_offset(
-                        base_link_pose.position, base_link_pose.rotation
-                    )
-                    stationary_april_pos.append(baselink_pos)
+                    # Use RAW AprilTag position (WITHOUT offset) for alignment
+                    # The offset will be applied AFTER alignment using the aligned rotation
+                    stationary_april_pos.append(base_link_pose.position)
                     stationary_odom_pos.append(odom_pos)
                     # Also collect quaternions for rotation alignment
                     april_quat = Rotation.from_matrix(base_link_pose.rotation).as_quat()
@@ -279,10 +266,16 @@ def compare_positions(
         if base_link_pose is None:
             continue
 
-        # Apply offset to get base_link position from AprilTag position
+        # First align the RAW AprilTag position to world frame
         april_pos_raw = base_link_pose.position
-        april_pos = apply_tag_to_baselink_offset(april_pos_raw, base_link_pose.rotation)
-        april_aligned = scale * (R @ april_pos) + t
+        april_aligned_before_offset = scale * (R @ april_pos_raw) + t
+
+        # Now apply the offset using the ALIGNED rotation
+        # The offset should be rotated by the aligned orientation, not the raw one
+        april_rot = Rotation.from_matrix(base_link_pose.rotation)
+        april_rot_aligned = R_rot_align * april_rot
+        offset_in_world = april_rot_aligned.as_matrix() @ APRILTAG_TO_BASELINK_OFFSET
+        april_aligned = april_aligned_before_offset - offset_in_world
 
         # Convert AprilTag rotation matrix to quaternion
         april_rot = Rotation.from_matrix(base_link_pose.rotation)
@@ -291,7 +284,7 @@ def compare_positions(
         april_rot_aligned = R_rot_align * april_rot
         april_quat_aligned = april_rot_aligned.as_quat()
 
-        april_positions.append(april_pos)
+        april_positions.append(april_pos_raw)  # Store raw position in camera frame
         april_positions_aligned.append(april_aligned)
         odom_positions.append(odom['position'])
         april_quats.append(april_quat_raw)
@@ -313,6 +306,8 @@ def compare_positions(
 
     # Compute orientation errors (angular difference in degrees) using aligned quaternions
     angle_errors = []
+    april_eulers = []  # Store euler angles for correlation analysis
+    odom_eulers = []
     for april_q, odom_q in zip(april_quats_aligned, odom_quats):
         # Compute relative rotation: R_diff = R_odom^-1 * R_april_aligned
         r_april = Rotation.from_quat(april_q)
@@ -321,14 +316,136 @@ def compare_positions(
         # Get angle of rotation (magnitude of axis-angle)
         angle = np.abs(r_diff.magnitude()) * 180 / np.pi  # degrees
         angle_errors.append(angle)
+        # Convert to euler angles (roll, pitch, yaw)
+        april_eulers.append(r_april.as_euler('xyz', degrees=True))
+        odom_eulers.append(r_odom.as_euler('xyz', degrees=True))
     angle_errors = np.array(angle_errors)
+    april_eulers = np.array(april_eulers)
+    odom_eulers = np.array(odom_eulers)
 
     # Filter outliers for statistics (based on position)
     inlier_mask = pos_error_norms < outlier_threshold
     n_outliers = np.sum(~inlier_mask)
+    n_inliers = np.sum(inlier_mask)
+
+    if n_inliers == 0:
+        raise ValueError(
+            f"All {len(pos_error_norms)} frames filtered as outliers (threshold={outlier_threshold}m). "
+            f"Position errors range from {np.min(pos_error_norms):.3f}m to {np.max(pos_error_norms):.3f}m. "
+            f"This suggests APRILTAG_TO_BASELINK_OFFSET may be incorrect. "
+            f"Try adjusting the offset or increasing outlier_threshold."
+        )
 
     pos_error_norms_filtered = pos_error_norms[inlier_mask]
     angle_errors_filtered = angle_errors[inlier_mask]
+
+    # Filter position and euler data for correlation calculation
+    april_positions_aligned_filtered = april_positions_aligned[inlier_mask]
+    odom_positions_filtered = odom_positions[inlier_mask]
+    april_eulers_filtered = april_eulers[inlier_mask]
+    odom_eulers_filtered = odom_eulers[inlier_mask]
+
+    # Compute correlation scores for position (X, Y, Z)
+    corr_x = np.corrcoef(april_positions_aligned_filtered[:, 0], odom_positions_filtered[:, 0])[0, 1]
+    corr_y = np.corrcoef(april_positions_aligned_filtered[:, 1], odom_positions_filtered[:, 1])[0, 1]
+    corr_z = np.corrcoef(april_positions_aligned_filtered[:, 2], odom_positions_filtered[:, 2])[0, 1]
+
+    # Compute correlation scores for orientation using quaternions
+    # Quaternions are better than Euler angles (no gimbal lock, no wrapping issues)
+    april_quats_aligned_filtered = april_quats_aligned[inlier_mask]
+    odom_quats_filtered = odom_quats[inlier_mask]
+
+    # Compute frame-to-frame angular velocities (rotation differences)
+    # This measures how well the tracker follows rotational changes
+    if len(april_quats_aligned_filtered) > 10:
+        april_angular_vel = []
+        odom_angular_vel = []
+
+        for i in range(1, len(april_quats_aligned_filtered)):
+            # Compute relative rotation between consecutive frames
+            r_april_prev = Rotation.from_quat(april_quats_aligned_filtered[i-1])
+            r_april_curr = Rotation.from_quat(april_quats_aligned_filtered[i])
+            r_odom_prev = Rotation.from_quat(odom_quats_filtered[i-1])
+            r_odom_curr = Rotation.from_quat(odom_quats_filtered[i])
+
+            # Angular change between frames
+            april_delta = r_april_curr * r_april_prev.inv()
+            odom_delta = r_odom_curr * r_odom_prev.inv()
+
+            # Convert to axis-angle to get angular velocity components
+            april_rotvec = april_delta.as_rotvec()  # [rad]
+            odom_rotvec = odom_delta.as_rotvec()
+
+            april_angular_vel.append(april_rotvec)
+            odom_angular_vel.append(odom_rotvec)
+
+        april_angular_vel = np.array(april_angular_vel)
+        odom_angular_vel = np.array(odom_angular_vel)
+
+        # Compute correlation for each axis of angular velocity
+        try:
+            if np.std(april_angular_vel[:, 0]) > 1e-5 and np.std(odom_angular_vel[:, 0]) > 1e-5:
+                corr_wx = np.corrcoef(april_angular_vel[:, 0], odom_angular_vel[:, 0])[0, 1]
+            else:
+                corr_wx = np.nan
+        except (ValueError, RuntimeWarning):
+            corr_wx = np.nan
+
+        try:
+            if np.std(april_angular_vel[:, 1]) > 1e-5 and np.std(odom_angular_vel[:, 1]) > 1e-5:
+                corr_wy = np.corrcoef(april_angular_vel[:, 1], odom_angular_vel[:, 1])[0, 1]
+            else:
+                corr_wy = np.nan
+        except (ValueError, RuntimeWarning):
+            corr_wy = np.nan
+
+        try:
+            if np.std(april_angular_vel[:, 2]) > 1e-5 and np.std(odom_angular_vel[:, 2]) > 1e-5:
+                corr_wz = np.corrcoef(april_angular_vel[:, 2], odom_angular_vel[:, 2])[0, 1]
+            else:
+                corr_wz = np.nan
+        except (ValueError, RuntimeWarning):
+            corr_wz = np.nan
+
+        # Also compute correlation on absolute quaternion components for reference
+        try:
+            corr_qx = np.corrcoef(april_quats_aligned_filtered[:, 0], odom_quats_filtered[:, 0])[0, 1]
+        except (ValueError, RuntimeWarning):
+            corr_qx = np.nan
+        try:
+            corr_qy = np.corrcoef(april_quats_aligned_filtered[:, 1], odom_quats_filtered[:, 1])[0, 1]
+        except (ValueError, RuntimeWarning):
+            corr_qy = np.nan
+        try:
+            corr_qz = np.corrcoef(april_quats_aligned_filtered[:, 2], odom_quats_filtered[:, 2])[0, 1]
+        except (ValueError, RuntimeWarning):
+            corr_qz = np.nan
+        try:
+            corr_qw = np.corrcoef(april_quats_aligned_filtered[:, 3], odom_quats_filtered[:, 3])[0, 1]
+        except (ValueError, RuntimeWarning):
+            corr_qw = np.nan
+    else:
+        corr_wx = np.nan
+        corr_wy = np.nan
+        corr_wz = np.nan
+        corr_qx = np.nan
+        corr_qy = np.nan
+        corr_qz = np.nan
+        corr_qw = np.nan
+
+    # Also compute Euler angles for human-readable variance reporting
+    roll_std_april = np.std(april_eulers_filtered[:, 0])
+    roll_std_odom = np.std(odom_eulers_filtered[:, 0])
+    pitch_std_april = np.std(april_eulers_filtered[:, 1])
+    pitch_std_odom = np.std(odom_eulers_filtered[:, 1])
+    yaw_std_april = np.std(april_eulers_filtered[:, 2])
+    yaw_std_odom = np.std(odom_eulers_filtered[:, 2])
+
+    # Map angular velocity correlations to Roll/Pitch/Yaw
+    # This is more meaningful than absolute orientation correlation
+    corr_roll = corr_wx
+    corr_pitch = corr_wy
+    corr_yaw = corr_wz
 
     # Compute position statistics
     mean_pos_err = np.mean(pos_error_norms_filtered) * 100  # cm
@@ -354,6 +471,10 @@ def compare_positions(
     print(f"50th percentile:   {p50_pos:.1f} cm")
     print(f"90th percentile:   {p90_pos:.1f} cm")
     print(f"99th percentile:   {p99_pos:.1f} cm")
+    print("\nCorrelation scores:")
+    print(f"  X: {corr_x:.4f}")
+    print(f"  Y: {corr_y:.4f}")
+    print(f"  Z: {corr_z:.4f}")
 
     print("\n=== Orientation Comparison ===")
     print(f"Mean error:        {mean_angle_err:.1f} deg")
@@ -362,6 +483,80 @@ def compare_positions(
     print(f"50th percentile:   {p50_angle:.1f} deg")
     print(f"90th percentile:   {p90_angle:.1f} deg")
     print(f"99th percentile:   {p99_angle:.1f} deg")
+    print("\nOrientation variance (std dev in degrees):")
+    print(f"  Roll:  AprilTag={roll_std_april:.2f}, Odom={roll_std_odom:.2f}")
+    print(f"  Pitch: AprilTag={pitch_std_april:.2f}, Odom={pitch_std_odom:.2f}")
+    print(f"  Yaw:   AprilTag={yaw_std_april:.2f}, Odom={yaw_std_odom:.2f}")
+
+    # Show range analysis for Euler angles
+    print("\nEuler angle ranges (degrees):")
+    april_roll_min, april_roll_max = np.min(april_eulers_filtered[:, 0]), np.max(april_eulers_filtered[:, 0])
+    april_pitch_min, april_pitch_max = np.min(april_eulers_filtered[:, 1]), np.max(april_eulers_filtered[:, 1])
+    april_yaw_min, april_yaw_max = np.min(april_eulers_filtered[:, 2]), np.max(april_eulers_filtered[:, 2])
+    odom_roll_min, odom_roll_max = np.min(odom_eulers_filtered[:, 0]), np.max(odom_eulers_filtered[:, 0])
+    odom_pitch_min, odom_pitch_max = np.min(odom_eulers_filtered[:, 1]), np.max(odom_eulers_filtered[:, 1])
+    odom_yaw_min, odom_yaw_max = np.min(odom_eulers_filtered[:, 2]), np.max(odom_eulers_filtered[:, 2])
+
+    april_roll_mean = np.mean(april_eulers_filtered[:, 0])
+    april_pitch_mean = np.mean(april_eulers_filtered[:, 1])
+    april_yaw_mean = np.mean(april_eulers_filtered[:, 2])
+    odom_roll_mean = np.mean(odom_eulers_filtered[:, 0])
+    odom_pitch_mean = np.mean(odom_eulers_filtered[:, 1])
+    odom_yaw_mean = np.mean(odom_eulers_filtered[:, 2])
+
+    print(f"  Roll:  April [{april_roll_min:6.2f}, {april_roll_max:6.2f}] mean={april_roll_mean:6.2f}  "
+          f"Odom [{odom_roll_min:6.2f}, {odom_roll_max:6.2f}] mean={odom_roll_mean:6.2f}")
+    print(f"  Pitch: April [{april_pitch_min:6.2f}, {april_pitch_max:6.2f}] mean={april_pitch_mean:6.2f}  "
+          f"Odom [{odom_pitch_min:6.2f}, {odom_pitch_max:6.2f}] mean={odom_pitch_mean:6.2f}")
+    print(f"  Yaw:   April [{april_yaw_min:6.2f}, {april_yaw_max:6.2f}] mean={april_yaw_mean:6.2f}  "
+          f"Odom [{odom_yaw_min:6.2f}, {odom_yaw_max:6.2f}] mean={odom_yaw_mean:6.2f}")
+
+    # Show angular velocity statistics
+    if len(april_quats_aligned_filtered) > 10:
+        print("\nAngular velocity statistics (rad/frame):")
+        print(f"  wx (roll):  April std={np.std(april_angular_vel[:, 0]):.6f}, "
+              f"Odom std={np.std(odom_angular_vel[:, 0]):.6f}")
+        print(f"  wy (pitch): April std={np.std(april_angular_vel[:, 1]):.6f}, "
+              f"Odom std={np.std(odom_angular_vel[:, 1]):.6f}")
+        print(f"  wz (yaw):   April std={np.std(april_angular_vel[:, 2]):.6f}, "
+              f"Odom std={np.std(odom_angular_vel[:, 2]):.6f}")
+
+        print("\nAngular velocity ranges (rad/frame):")
+        april_wx_min, april_wx_max = np.min(april_angular_vel[:, 0]), np.max(april_angular_vel[:, 0])
+        april_wy_min, april_wy_max = np.min(april_angular_vel[:, 1]), np.max(april_angular_vel[:, 1])
+        april_wz_min, april_wz_max = np.min(april_angular_vel[:, 2]), np.max(april_angular_vel[:, 2])
+        odom_wx_min, odom_wx_max = np.min(odom_angular_vel[:, 0]), np.max(odom_angular_vel[:, 0])
+        odom_wy_min, odom_wy_max = np.min(odom_angular_vel[:, 1]), np.max(odom_angular_vel[:, 1])
+        odom_wz_min, odom_wz_max = np.min(odom_angular_vel[:, 2]), np.max(odom_angular_vel[:, 2])
+
+        april_wx_mean = np.mean(april_angular_vel[:, 0])
+        april_wy_mean = np.mean(april_angular_vel[:, 1])
+        april_wz_mean = np.mean(april_angular_vel[:, 2])
+        odom_wx_mean = np.mean(odom_angular_vel[:, 0])
+        odom_wy_mean = np.mean(odom_angular_vel[:, 1])
+        odom_wz_mean = np.mean(odom_angular_vel[:, 2])
+
+        print(f"  wx (roll):  April [{april_wx_min:8.5f}, {april_wx_max:8.5f}] mean={april_wx_mean:8.5f}  "
+              f"Odom [{odom_wx_min:8.5f}, {odom_wx_max:8.5f}] mean={odom_wx_mean:8.5f}")
+        print(f"  wy (pitch): April [{april_wy_min:8.5f}, {april_wy_max:8.5f}] mean={april_wy_mean:8.5f}  "
+              f"Odom [{odom_wy_min:8.5f}, {odom_wy_max:8.5f}] mean={odom_wy_mean:8.5f}")
+        print(f"  wz (yaw):   April [{april_wz_min:8.5f}, {april_wz_max:8.5f}] mean={april_wz_mean:8.5f}  "
+              f"Odom [{odom_wz_min:8.5f}, {odom_wz_max:8.5f}] mean={odom_wz_mean:8.5f}")
+    print("\nAngular velocity correlation (frame-to-frame rotation changes):")
+    if np.isnan(corr_roll):
+        print("  Roll (wx):  N/A")
+    else:
+        print(f"  Roll (wx):  {corr_roll:.4f}")
+    if np.isnan(corr_pitch):
+        print("  Pitch (wy): N/A")
+    else:
+        print(f"  Pitch (wy): {corr_pitch:.4f}")
+    if np.isnan(corr_yaw):
+        print("  Yaw (wz):   N/A")
+    else:
+        print(f"  Yaw (wz):   {corr_yaw:.4f}")
+    print("\nAbsolute quaternion correlation (reference only):")
+    print(f"  qx: {corr_qx:.4f}, qy: {corr_qy:.4f}, qz: {corr_qz:.4f}, qw: {corr_qw:.4f}")
 
     return {
         'april_positions': april_positions_aligned[inlier_mask],
@@ -375,4 +570,14 @@ def compare_positions(
         'pos_error_norms': pos_error_norms_filtered,
         'angle_errors': angle_errors_filtered,
         'inlier_mask': inlier_mask,
+        'correlation_x': corr_x,
+        'correlation_y': corr_y,
+        'correlation_z': corr_z,
+        'correlation_qx': corr_qx,
+        'correlation_qy': corr_qy,
+        'correlation_qz': corr_qz,
+        'correlation_qw': corr_qw,
+        'correlation_roll': corr_roll,  # Angular velocity correlation (wx)
+        'correlation_pitch': corr_pitch,  # Angular velocity correlation (wy)
+        'correlation_yaw': corr_yaw,  # Angular velocity correlation (wz)
     }

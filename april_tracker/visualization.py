@@ -27,13 +27,8 @@ class SuppressQtWarnings:
 
 from .tracker_data_types import FrameResult
 from .tracker import AprilTagTracker
-from .config import APRILTAG_TO_BASELINK_OFFSET
-
-
-def apply_tag_to_baselink_offset(april_pos: np.ndarray, april_rot: np.ndarray) -> np.ndarray:
-    """Transform AprilTag position to base_link position using the known offset."""
-    offset_in_ref = april_rot @ APRILTAG_TO_BASELINK_OFFSET
-    return april_pos - offset_in_ref
+from .config import DEBUG_AXIS_FLIP_X, DEBUG_AXIS_FLIP_Y, DEBUG_AXIS_FLIP_Z
+from .processing import apply_tag_to_baselink_offset
 
 def plot_comparison(comparison: dict):
     """Plot AprilTag vs odometry position and orientation comparison."""
@@ -201,22 +196,27 @@ def visualize_on_frames(
         base_link_pose = result.poses.get('base_link')
 
         if base_link_pose is not None and odom is not None:
-            # Apply offset to get base_link position from AprilTag position
-            april_raw = apply_tag_to_baselink_offset(
+            # Apply offset to get base_link position from AprilTag position (in robot frame)
+            april_robot = apply_tag_to_baselink_offset(
                 base_link_pose.position, base_link_pose.rotation
             )
 
-            # Transform odom position back to AprilTag reference frame
+            # Transform odom position back to robot frame (same as april)
             odom_pos = odom['position']
-            odom_in_april_frame = R_inv @ (odom_pos - t) * scale_inv
+            odom_robot = R_inv @ (odom_pos - t) * scale_inv
 
-            # Project both to image using tracker's reference pose
-            ref_pose = tracker.reference_pose
+            # Transform from robot frame to camera frame for projection
+            # Robot: X=forward, Y=left, Z=up
+            # Camera: X=right, Y=down, Z=forward
+            # Inverse transform: camera = R_robot_to_cam @ robot
+            R_robot_to_cam = np.array([
+                [0, -1,  0],   # Camera X from -Robot Y
+                [0,  0, -1],   # Camera Y from -Robot Z
+                [1,  0,  0],   # Camera Z from Robot X
+            ])
 
-            # Base_link position (from AprilTag with offset) in camera frame
-            april_camera = ref_pose.rotation @ april_raw + ref_pose.position
-            # Odom position in camera frame
-            odom_camera = ref_pose.rotation @ odom_in_april_frame + ref_pose.position
+            april_camera = R_robot_to_cam @ april_robot
+            odom_camera = R_robot_to_cam @ odom_robot
 
             # Project to image
             cam_mat = tracker.camera_matrix
@@ -224,41 +224,95 @@ def visualize_on_frames(
                 april_x = int(cam_mat[0, 0] * april_camera[0] / april_camera[2] + cam_mat[0, 2])
                 april_y = int(cam_mat[1, 1] * april_camera[1] / april_camera[2] + cam_mat[1, 2])
 
-                odom_x = int(cam_mat[0, 0] * odom_camera[0] / odom_camera[2] + cam_mat[0, 2])
-                odom_y = int(cam_mat[1, 1] * odom_camera[1] / odom_camera[2] + cam_mat[1, 2])
+                if odom_camera[2] > 0:  # Check odom is in front too
+                    odom_x = int(cam_mat[0, 0] * odom_camera[0] / odom_camera[2] + cam_mat[0, 2])
+                    odom_y = int(cam_mat[1, 1] * odom_camera[1] / odom_camera[2] + cam_mat[1, 2])
+                else:
+                    odom_x = april_x
+                    odom_y = april_y
 
                 # Get quaternions for orientation axes
-                # AprilTag quaternion (raw, then aligned)
-                april_rot = Rotation.from_matrix(base_link_pose.rotation)
-                april_rot_aligned = R_rot_align * april_rot
-                # Odometry quaternion
-                odom_quat = odom['quaternion']
-                odom_rot = Rotation.from_quat(odom_quat)
+                # AprilTag quaternion (in robot frame)
+                april_rot_robot = Rotation.from_matrix(base_link_pose.rotation)
 
-                # Draw coordinate axes (SWAPPED: april point gets odom axes, odom point gets april axes)
+                # Odometry quaternion (in world/odom frame)
+                odom_quat = odom['quaternion']
+                odom_rot_world = Rotation.from_quat(odom_quat)
+
+                # Transform odometry rotation to robot frame
+                # R transforms robot -> world, so R.T transforms world -> robot
+                R_world_to_robot = Rotation.from_matrix(R.T)
+                odom_rot_robot = R_world_to_robot * odom_rot_world
+
+                # Transform from robot frame to OpenCV camera frame for visualization
+                # Robot: X=forward, Y=left, Z=up
+                # Camera: X=right, Y=down, Z=forward
+                R_robot_to_cam = np.array([
+                    [0, -1,  0],   # Camera X from -Robot Y
+                    [0,  0, -1],   # Camera Y from -Robot Z
+                    [1,  0,  0],   # Camera Z from Robot X
+                ])
+
+                # Draw coordinate axes
                 axis_length = 40
 
                 # Axis colors: X=Red, Y=Green, Z=Blue (RGB convention)
                 axis_colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR for OpenCV
                 axis_dirs = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
 
-                # For AprilTag point (blue circle): draw odometry coordinate axes
-                for axis_dir, color in zip(axis_dirs, axis_colors):
-                    odom_axis = odom_rot.apply(axis_dir)
-                    dx = int(axis_length * odom_axis[0])
-                    dy = int(-axis_length * odom_axis[1])  # flip y for image coords
-                    cv2.arrowedLine(frame, (april_x, april_y),
-                                   (april_x + dx, april_y + dy),
-                                   color, 2, tipLength=0.3)
+                # For AprilTag point (blue circle): draw AprilTag axes
+                for i, (axis_dir, color) in enumerate(zip(axis_dirs, axis_colors)):
+                    # Apply rotation in robot frame
+                    axis_robot = april_rot_robot.apply(axis_dir)
 
-                # For Odometry point (red circle): draw AprilTag coordinate axes
-                for axis_dir, color in zip(axis_dirs, axis_colors):
-                    april_axis = april_rot_aligned.apply(axis_dir)
-                    dx = int(axis_length * april_axis[0])
-                    dy = int(-axis_length * april_axis[1])
-                    cv2.arrowedLine(frame, (odom_x, odom_y),
-                                   (odom_x + dx, odom_y + dy),
-                                   color, 2, tipLength=0.3)
+                    # Apply debug flips
+                    flip_signs = np.array([
+                        -1.0 if DEBUG_AXIS_FLIP_X else 1.0,
+                        -1.0 if DEBUG_AXIS_FLIP_Y else 1.0,
+                        -1.0 if DEBUG_AXIS_FLIP_Z else 1.0
+                    ])
+                    axis_robot = axis_robot * flip_signs
+
+                    # Scale axis for visualization (in meters in robot frame)
+                    axis_robot_scaled = axis_robot * 0.1  # 10cm axis length
+                    # Add to the position to get endpoint in robot frame
+                    axis_endpoint_robot = april_robot + axis_robot_scaled
+                    # Transform to OpenCV camera frame
+                    axis_endpoint_camera = R_robot_to_cam @ axis_endpoint_robot
+                    # Project to image using pinhole model
+                    if axis_endpoint_camera[2] > 0.01:  # Only project if in front
+                        axis_endpoint_x = int(cam_mat[0, 0] * axis_endpoint_camera[0] / axis_endpoint_camera[2] + cam_mat[0, 2])
+                        axis_endpoint_y = int(cam_mat[1, 1] * axis_endpoint_camera[1] / axis_endpoint_camera[2] + cam_mat[1, 2])
+                        cv2.arrowedLine(frame, (april_x, april_y),
+                                       (axis_endpoint_x, axis_endpoint_y),
+                                       color, 2, tipLength=0.3)
+
+                # For Odometry point (red circle): draw odometry axes
+                for i, (axis_dir, color) in enumerate(zip(axis_dirs, axis_colors)):
+                    # Apply rotation in robot frame (after transformation from world)
+                    axis_robot = odom_rot_robot.apply(axis_dir)
+
+                    # Apply debug flips
+                    flip_signs = np.array([
+                        -1.0 if DEBUG_AXIS_FLIP_X else 1.0,
+                        -1.0 if DEBUG_AXIS_FLIP_Y else 1.0,
+                        -1.0 if DEBUG_AXIS_FLIP_Z else 1.0
+                    ])
+                    axis_robot = axis_robot * flip_signs
+
+                    # Scale axis for visualization (in meters in robot frame)
+                    axis_robot_scaled = axis_robot * 0.1  # 10cm axis length
+                    # Add to the position to get endpoint in robot frame
+                    axis_endpoint_robot = odom_robot + axis_robot_scaled
+                    # Transform to OpenCV camera frame
+                    axis_endpoint_camera = R_robot_to_cam @ axis_endpoint_robot
+                    # Project to image using pinhole model
+                    if axis_endpoint_camera[2] > 0.01:  # Only project if in front
+                        axis_endpoint_x = int(cam_mat[0, 0] * axis_endpoint_camera[0] / axis_endpoint_camera[2] + cam_mat[0, 2])
+                        axis_endpoint_y = int(cam_mat[1, 1] * axis_endpoint_camera[1] / axis_endpoint_camera[2] + cam_mat[1, 2])
+                        cv2.arrowedLine(frame, (odom_x, odom_y),
+                                       (axis_endpoint_x, axis_endpoint_y),
+                                       color, 2, tipLength=0.3)
 
                 # Draw error line (green)
                 cv2.line(frame, (april_x, april_y), (odom_x, odom_y), (0, 255, 0), 2)
@@ -272,11 +326,12 @@ def visualize_on_frames(
                 cv2.circle(frame, (odom_x, odom_y), 14, (0, 0, 0), 2)
 
                 # Compute and display errors (XYZ)
-                april_aligned = scale * (R @ april_raw) + t
+                april_aligned = scale * (R @ april_robot) + t
                 pos_error = np.linalg.norm(april_aligned - odom_pos) * 100  # cm
 
-                # Compute angle error
-                r_diff = odom_rot.inv() * april_rot_aligned
+                # Compute angle error (using aligned rotations in world frame)
+                april_rot_aligned = R_rot_align * april_rot_robot
+                r_diff = odom_rot_world.inv() * april_rot_aligned
                 angle_error = np.abs(r_diff.magnitude()) * 180 / np.pi
 
                 cv2.putText(frame, f"Pos err: {pos_error:.1f}cm  Ang err: {angle_error:.1f}deg", (10, 70),
