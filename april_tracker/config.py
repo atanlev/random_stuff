@@ -6,8 +6,8 @@ import numpy as np
 from .tracker_data_types import RigidBodyConfig
 from .tracker import AprilTagTracker
 
-ZED_FRAMES_PATH = "zed_frames3.pkl"
-WALK_LOG_PATH = "walk_log3.pkl"
+ZED_FRAMES_PATH = "zed_frames.pkl"
+WALK_LOG_PATH = "walk_log.pkl"
 
 # Tag configuration
 TAG_SIZE_M = 0.116

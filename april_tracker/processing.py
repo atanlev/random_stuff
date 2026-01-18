@@ -716,6 +716,114 @@ def compare_positions(
     print("\nAbsolute quaternion correlation (reference only):")
     print(f"  qx: {corr_qx:.4f}, qy: {corr_qy:.4f}, qz: {corr_qz:.4f}, qw: {corr_qw:.4f}")
 
+    # Compute axis decoupling scores
+    # For each axis, the diagonal correlation should be high and off-diagonal should be low
+    # Build correlation matrix from euler angles
+    corr_matrix = np.zeros((3, 3))
+    for i in range(3):
+        for j in range(3):
+            corr_matrix[i, j] = np.corrcoef(april_eulers_filtered[:, i], odom_eulers_filtered[:, j])[0, 1]
+
+    # Decoupling score for each axis:
+    # Score = |diagonal| - max(|off-diagonal|)
+    # Perfect decoupling: diagonal = 1.0, off-diagonal = 0.0 -> score = 1.0
+    # Complete mixing: diagonal = 0.0, off-diagonal = 1.0 -> score = -1.0
+    axis_names_short = ['Roll', 'Pitch', 'Yaw']
+    decoupling_scores = []
+    for i in range(3):
+        diagonal = abs(corr_matrix[i, i])
+        off_diag = [abs(corr_matrix[i, j]) for j in range(3) if j != i]
+        max_off_diag = max(off_diag)
+        score = diagonal - max_off_diag
+        decoupling_scores.append(score)
+
+    # Overall decoupling score (average of all axes)
+    overall_decoupling = np.mean(decoupling_scores)
+
+    # Grade the decoupling
+    def grade_score(score):
+        if score >= 0.8:
+            return 'A'
+        elif score >= 0.6:
+            return 'B'
+        elif score >= 0.4:
+            return 'C'
+        elif score >= 0.2:
+            return 'D'
+        else:
+            return 'F'
+
+    # Print summary table
+    print("\n" + "=" * 70)
+    print("                        ALIGNMENT SUMMARY")
+    print("=" * 70)
+
+    print("\n┌─────────────────────────────────────────────────────────────────────┐")
+    print("│                         POSITION METRICS                           │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print(f"│  Mean Error:     {mean_pos_err:6.1f} cm    │  Correlation X:  {corr_x:6.4f}       │")
+    print(f"│  Std Error:      {std_pos_err:6.1f} cm    │  Correlation Y:  {corr_y:6.4f}       │")
+    print(f"│  90th %ile:      {p90_pos:6.1f} cm    │  Correlation Z:  {corr_z:6.4f}       │")
+    print(f"│  Max Error:      {max_pos_err:6.1f} cm    │  Frames:         {n_inliers:6d}         │")
+    print("└─────────────────────────────────────────────────────────────────────┘")
+
+    print("\n┌─────────────────────────────────────────────────────────────────────┐")
+    print("│                       ORIENTATION METRICS                          │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print(f"│  Mean Error:     {mean_angle_err:6.1f} deg   │  Ang Vel Corr (wx): {corr_roll if not np.isnan(corr_roll) else 0:6.4f}  │")
+    print(f"│  Std Error:      {std_angle_err:6.1f} deg   │  Ang Vel Corr (wy): {corr_pitch if not np.isnan(corr_pitch) else 0:6.4f}  │")
+    print(f"│  90th %ile:      {p90_angle:6.1f} deg   │  Ang Vel Corr (wz): {corr_yaw if not np.isnan(corr_yaw) else 0:6.4f}  │")
+    print(f"│  Max Error:      {max_angle_err:6.1f} deg   │                               │")
+    print("└─────────────────────────────────────────────────────────────────────┘")
+
+    print("\n┌─────────────────────────────────────────────────────────────────────┐")
+    print("│                     AXIS DECOUPLING ANALYSIS                       │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print("│  Correlation Matrix (AprilTag Euler → Odom Euler):                 │")
+    print("│              Odom Roll   Odom Pitch   Odom Yaw                     │")
+    for i, name in enumerate(axis_names_short):
+        print(f"│  {name:5}       {corr_matrix[i, 0]:7.3f}      {corr_matrix[i, 1]:7.3f}      {corr_matrix[i, 2]:7.3f}                    │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print("│  Decoupling Scores (diagonal - max off-diagonal):                  │")
+    for i, name in enumerate(axis_names_short):
+        grade = grade_score(decoupling_scores[i])
+        bar_len = int(max(0, min(20, (decoupling_scores[i] + 1) * 10)))
+        bar = '█' * bar_len + '░' * (20 - bar_len)
+        print(f"│  {name:5}:  {decoupling_scores[i]:+6.3f}  [{bar}]  Grade: {grade}      │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    overall_grade = grade_score(overall_decoupling)
+    overall_bar_len = int(max(0, min(20, (overall_decoupling + 1) * 10)))
+    overall_bar = '█' * overall_bar_len + '░' * (20 - overall_bar_len)
+    print(f"│  OVERALL: {overall_decoupling:+6.3f}  [{overall_bar}]  Grade: {overall_grade}      │")
+    print("└─────────────────────────────────────────────────────────────────────┘")
+
+    # Interpretation
+    print("\n┌─────────────────────────────────────────────────────────────────────┐")
+    print("│                         INTERPRETATION                             │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    if overall_decoupling >= 0.6:
+        print("│  ✓ Axes are well decoupled - rotation alignment is working well   │")
+    elif overall_decoupling >= 0.3:
+        print("│  ~ Partial decoupling - some axis mixing remains                  │")
+    else:
+        print("│  ✗ Significant axis mixing - alignment may need improvement       │")
+
+    if mean_pos_err < 10:
+        print("│  ✓ Position accuracy is excellent (<10cm)                         │")
+    elif mean_pos_err < 20:
+        print("│  ~ Position accuracy is acceptable (10-20cm)                      │")
+    else:
+        print("│  ✗ Position accuracy needs improvement (>20cm)                    │")
+
+    if mean_angle_err < 5:
+        print("│  ✓ Orientation accuracy is excellent (<5°)                        │")
+    elif mean_angle_err < 10:
+        print("│  ~ Orientation accuracy is acceptable (5-10°)                     │")
+    else:
+        print("│  ✗ Orientation accuracy needs improvement (>10°)                  │")
+    print("└─────────────────────────────────────────────────────────────────────┘")
+    print("=" * 70)
+
     return {
         'april_positions': april_positions_aligned[inlier_mask],
         'april_positions_raw': april_positions[inlier_mask],
