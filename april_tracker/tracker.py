@@ -78,24 +78,24 @@ class AprilTagTracker:
         R_camera, _ = cv2.Rodrigues(rvec)
         t_camera = tvec.flatten()
 
-        # Transform from camera frame to robot frame
-        # Camera: X=right, Y=down, Z=forward
+        # Transform position from camera frame to robot frame
+        # Camera: X=right, Y=down, Z=forward (toward robot)
         # Robot:  X=forward, Y=left, Z=up
-        #
-        # Mapping:
-        # Robot X (forward) <- Camera Z (forward)
-        # Robot Y (left) <- -Camera X (right)
-        # Robot Z (up) <- -Camera Y (down)
-        R_cam_to_robot = np.array([
-            [0,  0,  1],   # Robot X from Camera Z (forward)
-            [-1, 0,  0],   # Robot Y from -Camera X (right->left)
-            [0, -1,  0],   # Robot Z from -Camera Y (down->up)
+        # Camera faces robot, so:
+        #   Robot X = -Camera Z
+        #   Robot Y = Camera X
+        #   Robot Z = -Camera Y
+        R_cam_to_robot_pos = np.array([
+            [0,  0, -1],
+            [1,  0,  0],
+            [0, -1,  0],
         ])
+        t_robot = R_cam_to_robot_pos @ t_camera
 
-        # Apply coordinate transform
-        t_robot = R_cam_to_robot @ t_camera
-        # Similarity transform for rotation basis change
-        R_robot = R_cam_to_robot @ R_camera @ R_cam_to_robot.T
+        # solvePnP gives R_camera = rotation of TAG in CAMERA frame
+        # We want the robot's orientation, which is the INVERSE (camera in tag frame)
+        # Then we need to account for the camera facing the robot
+        R_robot = R_camera.T  # Transpose = inverse for rotation matrix
 
         return Pose(position=t_robot, rotation=R_robot)
 

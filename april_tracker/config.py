@@ -20,7 +20,9 @@ RIGID_BODIES = [
 # AprilTag is 8cm forward (X) and 6cm up (Z) from base_link
 # NOTE: This offset is used to transform the detected AprilTag position to base_link
 # If the AprilTag is mounted FORWARD and UP from base_link, the offset should be POSITIVE
-APRILTAG_TO_BASELINK_OFFSET = np.array([-0.08, 0.0, -0.0])  # X=forward, Y=left, Z=up
+# AprilTag is 8cm forward (X) and 6cm up (Z) from base_link
+# Set to zero - offset will be searched automatically
+APRILTAG_TO_BASELINK_OFFSET = np.array([0.0, 0.0, 0.0])  # X=forward, Y=left, Z=up
 
 # ZED camera intrinsics
 CAMERA_MATRIX = np.array([

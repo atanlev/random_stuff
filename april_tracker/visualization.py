@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 from typing import Optional
 from scipy.spatial.transform import Rotation
 
+from .processing import apply_rotation_alignment
+
 import os
 import sys
 
@@ -160,7 +162,7 @@ def visualize_on_frames(
     R: np.ndarray,
     scale: float,
     t: np.ndarray,
-    R_rot_align: Rotation,
+    R_rot_align: tuple,
     output_path: Optional[str] = None,
 ):
     """
@@ -206,13 +208,23 @@ def visualize_on_frames(
             odom_robot = R_inv @ (odom_pos - t) * scale_inv
 
             # Transform from robot frame to camera frame for projection
-            # Robot: X=forward, Y=left, Z=up
-            # Camera: X=right, Y=down, Z=forward
-            # Inverse transform: camera = R_robot_to_cam @ robot
+            # Robot frame (from tracker.py): X=forward (toward camera), Y=left, Z=up
+            # BUT the position is the tag's position as seen from camera,
+            # so Robot X is negative (tag is in front of camera, pointing away)
+            # Camera frame: X=right, Y=down, Z=forward
+            #
+            # The tracker outputs positions where:
+            #   Robot X = -Camera Z (forward in robot = backward in camera depth)
+            #   Robot Y = Camera X (left in robot = right in camera)
+            #   Robot Z = -Camera Y (up in robot = down in camera)
+            # So to go back: Camera = inverse of that transform
+            #   Camera X = Robot Y
+            #   Camera Y = -Robot Z
+            #   Camera Z = -Robot X
             R_robot_to_cam = np.array([
-                [0, -1,  0],   # Camera X from -Robot Y
+                [0,  1,  0],   # Camera X from Robot Y
                 [0,  0, -1],   # Camera Y from -Robot Z
-                [1,  0,  0],   # Camera Z from Robot X
+                [-1, 0,  0],   # Camera Z from -Robot X
             ])
 
             april_camera = R_robot_to_cam @ april_robot
@@ -232,25 +244,27 @@ def visualize_on_frames(
                     odom_y = april_y
 
                 # Get quaternions for orientation axes
-                # AprilTag quaternion (in robot frame)
-                april_rot_robot = Rotation.from_matrix(base_link_pose.rotation)
+                # AprilTag quaternion (in robot frame) - apply rotation alignment
+                april_rot_raw = Rotation.from_matrix(base_link_pose.rotation)
+                april_rot_aligned = apply_rotation_alignment(april_rot_raw, R_rot_align)
 
                 # Odometry quaternion (in world/odom frame)
                 odom_quat = odom['quaternion']
                 odom_rot_world = Rotation.from_quat(odom_quat)
 
-                # Transform odometry rotation to robot frame
-                # R transforms robot -> world, so R.T transforms world -> robot
+                # For visualization, we want both in the same frame
+                # The aligned AprilTag rotation is now in world frame (like odometry)
+                # Transform both to robot frame for visualization
                 R_world_to_robot = Rotation.from_matrix(R.T)
+                april_rot_robot = R_world_to_robot * april_rot_aligned
                 odom_rot_robot = R_world_to_robot * odom_rot_world
 
                 # Transform from robot frame to OpenCV camera frame for visualization
-                # Robot: X=forward, Y=left, Z=up
-                # Camera: X=right, Y=down, Z=forward
+                # (Same transform as above for positions)
                 R_robot_to_cam = np.array([
-                    [0, -1,  0],   # Camera X from -Robot Y
+                    [0,  1,  0],   # Camera X from Robot Y
                     [0,  0, -1],   # Camera Y from -Robot Z
-                    [1,  0,  0],   # Camera Z from Robot X
+                    [-1, 0,  0],   # Camera Z from -Robot X
                 ])
 
                 # Draw coordinate axes
@@ -330,7 +344,6 @@ def visualize_on_frames(
                 pos_error = np.linalg.norm(april_aligned - odom_pos) * 100  # cm
 
                 # Compute angle error (using aligned rotations in world frame)
-                april_rot_aligned = R_rot_align * april_rot_robot
                 r_diff = odom_rot_world.inv() * april_rot_aligned
                 angle_error = np.abs(r_diff.magnitude()) * 180 / np.pi
 
@@ -369,14 +382,18 @@ def visualize_on_frames(
         if writer:
             writer.write(frame)
 
-        with SuppressQtWarnings():
+        # Try to display frame, but don't fail if display is unavailable
+        try:
             cv2.imshow('AprilTag vs Odometry', frame)
             key = cv2.waitKey(1 if not paused else 0) & 0xFF
 
-        if key == ord('q'):
-            break
-        elif key == ord(' '):
-            paused = not paused
+            if key == ord('q'):
+                break
+            elif key == ord(' '):
+                paused = not paused
+        except cv2.error:
+            # Display not available, just continue processing frames
+            pass
 
         frame_idx += 1
 
@@ -384,5 +401,7 @@ def visualize_on_frames(
         writer.release()
         print(f"Saved visualization video to: {output_path}")
 
-    with SuppressQtWarnings():
+    try:
         cv2.destroyAllWindows()
+    except cv2.error:
+        pass

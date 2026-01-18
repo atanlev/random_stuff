@@ -206,12 +206,47 @@ def process_frames(
 
     print(f"Found {len(stationary_april_pos)} stationary frames for alignment")
 
+    # Analyze raw axis correlations to find correct mapping
+    if len(stationary_april_quats) >= 10:
+        print("\n=== RAW AXIS CORRELATION ANALYSIS ===")
+        print("This shows correlation between each AprilTag axis and each Odom axis")
+        print("Look for high absolute correlations (close to +1 or -1) to find axis mapping\n")
+
+        # Convert to euler angles
+        april_eulers_raw = np.array([Rotation.from_quat(q).as_euler('xyz', degrees=True)
+                                      for q in stationary_april_quats])
+        odom_eulers_raw = np.array([Rotation.from_quat(q).as_euler('xyz', degrees=True)
+                                     for q in stationary_odom_quats])
+
+        axis_names = ['Roll (X)', 'Pitch (Y)', 'Yaw (Z)']
+
+        # Print correlation matrix
+        print("Correlation Matrix (AprilTag vs Odom):")
+        print(f"{'':12} | {'Odom Roll':>10} {'Odom Pitch':>11} {'Odom Yaw':>10}")
+        print("-" * 50)
+        for i, april_axis in enumerate(axis_names):
+            row = f"{april_axis:12} |"
+            for j in range(3):
+                corr = np.corrcoef(april_eulers_raw[:, i], odom_eulers_raw[:, j])[0, 1]
+                row += f" {corr:>10.3f}"
+            print(row)
+
+        print("\nValue ranges:")
+        for i, name in enumerate(axis_names):
+            april_min, april_max = np.min(april_eulers_raw[:, i]), np.max(april_eulers_raw[:, i])
+            odom_min, odom_max = np.min(odom_eulers_raw[:, i]), np.max(odom_eulers_raw[:, i])
+            april_std = np.std(april_eulers_raw[:, i])
+            odom_std = np.std(odom_eulers_raw[:, i])
+            print(f"  {name}: April [{april_min:7.2f}, {april_max:7.2f}] std={april_std:5.2f}  "
+                  f"Odom [{odom_min:7.2f}, {odom_max:7.2f}] std={odom_std:5.2f}")
+        print("=" * 50 + "\n")
+
     if len(stationary_april_pos) < 10:
         print("Warning: Not enough stationary frames for alignment, using identity transform")
         R = np.eye(3)
         scale = 1.0
         t = np.zeros(3)
-        R_rot_align = Rotation.identity()
+        R_rot_align = (Rotation.identity(), np.eye(3))  # (offset, remap)
     else:
         stationary_april_pos = np.array(stationary_april_pos)
         stationary_odom_pos = np.array(stationary_odom_pos)
@@ -227,10 +262,99 @@ def process_frames(
         # Compute rotation alignment using inlier stationary frames
         inlier_april_quats = [q for q, m in zip(stationary_april_quats, inlier_mask) if m]
         inlier_odom_quats = [q for q, m in zip(stationary_odom_quats, inlier_mask) if m]
-        R_rot_align = compute_rotation_alignment(inlier_april_quats, inlier_odom_quats)
-        print(f"Rotation alignment: {R_rot_align.as_euler('xyz', degrees=True)} (euler xyz deg)")
+        R_rot_offset, R_axis_remap = compute_rotation_alignment(inlier_april_quats, inlier_odom_quats)
+        R_rot_align = (R_rot_offset, R_axis_remap)  # Pack as tuple
+        print(f"Rotation offset: {R_rot_offset.as_euler('xyz', degrees=True)} (euler xyz deg)")
 
     return april_results, matched_odom, frames_used, R, scale, t, R_rot_align, time_offset_s
+
+
+def find_best_offset(
+    april_results: list,
+    matched_odom: list,
+    R: np.ndarray,
+    scale: float,
+    t: np.ndarray,
+    R_rot_align: tuple,
+    search_range: float = 0.15,  # Search +/- 15cm
+    step: float = 0.02,  # 2cm steps
+) -> np.ndarray:
+    """
+    Search for the best tag-to-baselink offset by minimizing position error.
+
+    Returns:
+        Best offset as numpy array [x, y, z]
+    """
+    best_offset = np.array([0.0, 0.0, 0.0])
+    best_error = float('inf')
+
+    # Search over X and Z (Y is typically 0 for centered tags)
+    for ox in np.arange(-search_range, search_range + step, step):
+        for oz in np.arange(-search_range, search_range + step, step):
+            offset = np.array([ox, 0.0, oz])
+
+            # Compute position error with this offset
+            errors = []
+            for result, odom in zip(april_results, matched_odom):
+                if odom is None:
+                    continue
+                base_link_pose = result.poses.get('base_link')
+                if base_link_pose is None:
+                    continue
+
+                april_pos_raw = base_link_pose.position
+                april_aligned_before_offset = scale * (R @ april_pos_raw) + t
+
+                april_rot = Rotation.from_matrix(base_link_pose.rotation)
+                april_rot_aligned = apply_rotation_alignment(april_rot, R_rot_align)
+                offset_in_world = april_rot_aligned.as_matrix() @ offset
+                april_aligned = april_aligned_before_offset - offset_in_world
+
+                odom_pos = odom['position']
+                error = np.linalg.norm(april_aligned - odom_pos)
+                if error < 0.5:  # Only count inliers
+                    errors.append(error)
+
+            if len(errors) > 10:
+                mean_error = np.mean(errors)
+                if mean_error < best_error:
+                    best_error = mean_error
+                    best_offset = offset.copy()
+
+    print(f"\n  Best offset found: [{best_offset[0]:.3f}, {best_offset[1]:.3f}, {best_offset[2]:.3f}] m")
+    print(f"  Position error with offset: {best_error * 100:.1f} cm")
+
+    return best_offset
+
+
+def apply_rotation_alignment(april_rot: Rotation, R_rot_align: tuple) -> Rotation:
+    """
+    Apply rotation alignment to an AprilTag rotation.
+
+    The alignment can work in two modes:
+    1. If R_remap is identity: simple left-multiply R_offset @ R_april
+    2. If R_remap is non-identity: similarity transform + offset
+       R_offset @ (R_remap @ R_april @ R_remap.T)
+
+    Args:
+        april_rot: Raw AprilTag rotation
+        R_rot_align: Tuple of (R_offset, R_remap) where R_offset is a Rotation
+                     and R_remap is a 3x3 numpy array
+
+    Returns:
+        Aligned rotation
+    """
+    R_offset, R_remap = R_rot_align
+
+    # Check if R_remap is identity (left-multiply mode)
+    if np.allclose(R_remap, np.eye(3)):
+        # Simple left-multiply: R_aligned = R_offset @ R_april
+        return R_offset * april_rot
+    else:
+        # Similarity transform mode: R_aligned = R_offset @ (R_remap @ R_april @ R_remap.T)
+        R_remapped = R_remap @ april_rot.as_matrix() @ R_remap.T
+        april_rot_remapped = Rotation.from_matrix(R_remapped)
+        return R_offset * april_rot_remapped
 
 
 def compare_positions(
@@ -239,8 +363,9 @@ def compare_positions(
     R: np.ndarray,
     scale: float,
     t: np.ndarray,
-    R_rot_align: Rotation,
+    R_rot_align: tuple,
     outlier_threshold: float = 0.5,
+    tag_offset: np.ndarray = None,
 ) -> dict:
     """
     Compare AprilTag base_link positions and orientations with odometry.
@@ -248,8 +373,14 @@ def compare_positions(
     Applies rotation alignment to AprilTag orientations.
     Filters outliers based on error threshold.
 
+    Args:
+        tag_offset: Optional offset from tag to base_link. If None, uses config value.
+
     Returns dict with comparison data.
     """
+    if tag_offset is None:
+        tag_offset = APRILTAG_TO_BASELINK_OFFSET
+
     april_positions = []
     april_positions_aligned = []
     odom_positions = []
@@ -273,15 +404,12 @@ def compare_positions(
         # Now apply the offset using the ALIGNED rotation
         # The offset should be rotated by the aligned orientation, not the raw one
         april_rot = Rotation.from_matrix(base_link_pose.rotation)
-        april_rot_aligned = R_rot_align * april_rot
-        offset_in_world = april_rot_aligned.as_matrix() @ APRILTAG_TO_BASELINK_OFFSET
+        april_rot_aligned = apply_rotation_alignment(april_rot, R_rot_align)
+        offset_in_world = april_rot_aligned.as_matrix() @ tag_offset
         april_aligned = april_aligned_before_offset - offset_in_world
 
         # Convert AprilTag rotation matrix to quaternion
-        april_rot = Rotation.from_matrix(base_link_pose.rotation)
         april_quat_raw = april_rot.as_quat()  # [x, y, z, w]
-        # Apply rotation alignment
-        april_rot_aligned = R_rot_align * april_rot
         april_quat_aligned = april_rot_aligned.as_quat()
 
         april_positions.append(april_pos_raw)  # Store raw position in camera frame
@@ -440,6 +568,36 @@ def compare_positions(
     pitch_std_odom = np.std(odom_eulers_filtered[:, 1])
     yaw_std_april = np.std(april_eulers_filtered[:, 2])
     yaw_std_odom = np.std(odom_eulers_filtered[:, 2])
+
+    # Print post-alignment correlation matrix
+    print("\n=== POST-ALIGNMENT AXIS CORRELATION (xyz euler) ===")
+    axis_names = ['Roll (X)', 'Pitch (Y)', 'Yaw (Z)']
+    print("Correlation Matrix (Aligned AprilTag vs Odom):")
+    print(f"{'':12} | {'Odom Roll':>10} {'Odom Pitch':>11} {'Odom Yaw':>10}")
+    print("-" * 50)
+    for i, april_axis in enumerate(axis_names):
+        row = f"{april_axis:12} |"
+        for j in range(3):
+            corr = np.corrcoef(april_eulers_filtered[:, i], odom_eulers_filtered[:, j])[0, 1]
+            row += f" {corr:>10.3f}"
+        print(row)
+
+    # Also try ZYX euler (more common for ground robots - yaw first)
+    april_eulers_zyx = np.array([Rotation.from_quat(q).as_euler('ZYX', degrees=True)
+                                  for q in april_quats_aligned_filtered])
+    odom_eulers_zyx = np.array([Rotation.from_quat(q).as_euler('ZYX', degrees=True)
+                                 for q in odom_quats_filtered])
+    print("\nCorrelation Matrix (ZYX euler - Yaw/Pitch/Roll order):")
+    axis_names_zyx = ['Yaw (Z)', 'Pitch (Y)', 'Roll (X)']
+    print(f"{'':12} | {'Odom Yaw':>10} {'Odom Pitch':>11} {'Odom Roll':>10}")
+    print("-" * 50)
+    for i, april_axis in enumerate(axis_names_zyx):
+        row = f"{april_axis:12} |"
+        for j in range(3):
+            corr = np.corrcoef(april_eulers_zyx[:, i], odom_eulers_zyx[:, j])[0, 1]
+            row += f" {corr:>10.3f}"
+        print(row)
+    print("=" * 50)
 
     # Map angular velocity correlations to Roll/Pitch/Yaw
     # This is more meaningful than absolute orientation correlation

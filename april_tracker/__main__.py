@@ -3,7 +3,7 @@ import argparse
 
 from .tracker_io import load_zed_frames, load_walk_log
 from .config import create_tracker, AUTO_TIME_OFFSET, ZED_FRAMES_PATH, WALK_LOG_PATH, ODOM_FRAME
-from .processing import process_frames, compare_positions
+from .processing import process_frames, compare_positions, find_best_offset
 from .visualization import plot_comparison, visualize_on_frames
 
 
@@ -43,7 +43,12 @@ def main():
     )
     print(f"\nTime offset applied: {time_offset * 1000:.1f} ms")
 
-    comparison = compare_positions(april_results, matched_odom, R, scale, t, R_rot_align)
+    # Search for best tag-to-baselink offset
+    print("\nSearching for optimal tag-to-baselink offset...")
+    best_offset = find_best_offset(april_results, matched_odom, R, scale, t, R_rot_align)
+
+    comparison = compare_positions(april_results, matched_odom, R, scale, t, R_rot_align,
+                                   tag_offset=best_offset)
 
     plot_comparison(comparison)
 

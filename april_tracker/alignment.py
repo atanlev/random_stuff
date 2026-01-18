@@ -79,34 +79,146 @@ def compute_alignment_transform(
 def compute_rotation_alignment(
     april_quats: list[np.ndarray],
     odom_quats: list[np.ndarray],
-) -> Rotation:
+) -> tuple[Rotation, np.ndarray]:
     """
     Compute rotation alignment between AprilTag and odometry orientations.
-    Uses average of relative rotations from stationary frames.
+
+    Uses iterative optimization to find R_pre such that:
+        R_odom ≈ R_offset @ R_pre @ R_april @ R_pre.T
+
+    The R_pre matrix is found by searching over all 24 axis permutations,
+    then refined using gradient-free optimization.
 
     Returns:
-        R_rot_align: Rotation to apply to AprilTag quaternions to align with odometry
+        R_offset: Residual rotation offset
+        R_pre: 3x3 pre-multiplication matrix for similarity transform
     """
-    # Compute relative rotation for each pair: R_align = R_odom * R_april^-1
+    from scipy.optimize import minimize
+
+    april_rots = [Rotation.from_quat(q) for q in april_quats]
+    odom_rots = [Rotation.from_quat(q) for q in odom_quats]
+
+    def compute_rms_error(R_pre, R_offset=None):
+        """Compute RMS angular error for given R_pre (and optionally R_offset)."""
+        if R_offset is None:
+            # Compute optimal offset for this R_pre
+            relative_rots = []
+            for r_april, r_odom in zip(april_rots, odom_rots):
+                R_sim = R_pre @ r_april.as_matrix() @ R_pre.T
+                r_sim = Rotation.from_matrix(R_sim)
+                r_rel = r_odom * r_sim.inv()
+                relative_rots.append(r_rel)
+
+            quats = np.array([r.as_quat() for r in relative_rots])
+            for i in range(1, len(quats)):
+                if np.dot(quats[i], quats[0]) < 0:
+                    quats[i] = -quats[i]
+            mean_quat = np.mean(quats, axis=0)
+            mean_quat = mean_quat / np.linalg.norm(mean_quat)
+            R_offset = Rotation.from_quat(mean_quat)
+
+        total_err = 0.0
+        for r_april, r_odom in zip(april_rots, odom_rots):
+            R_sim = R_pre @ r_april.as_matrix() @ R_pre.T
+            r_sim = Rotation.from_matrix(R_sim)
+            r_aligned = R_offset * r_sim
+            r_diff = r_odom * r_aligned.inv()
+            total_err += r_diff.magnitude() ** 2
+
+        return np.sqrt(total_err / len(april_quats)), R_offset
+
+    # Step 1: Try all 24 proper rotations (axis permutations)
+    print("  Searching over 24 axis permutations...")
+    best_perm_error = float('inf')
+    best_P = np.eye(3)
+
+    axis_permutations = [
+        [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]
+    ]
+    sign_combos = [
+        [1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]
+    ]
+
+    for perm in axis_permutations:
+        for signs in sign_combos:
+            P = np.zeros((3, 3))
+            for i, (p, s) in enumerate(zip(perm, signs)):
+                P[i, p] = s
+
+            if np.linalg.det(P) < 0:
+                continue
+
+            rms, _ = compute_rms_error(P)
+            if rms < best_perm_error:
+                best_perm_error = rms
+                best_P = P.copy()
+
+    print(f"  Best axis permutation RMS error: {best_perm_error * 180 / np.pi:.2f} deg")
+    print("  Best permutation matrix P:")
+    print(f"    [{best_P[0, 0]:6.3f}, {best_P[0, 1]:6.3f}, {best_P[0, 2]:6.3f}]")
+    print(f"    [{best_P[1, 0]:6.3f}, {best_P[1, 1]:6.3f}, {best_P[1, 2]:6.3f}]")
+    print(f"    [{best_P[2, 0]:6.3f}, {best_P[2, 1]:6.3f}, {best_P[2, 2]:6.3f}]")
+
+    # Step 2: Refine using continuous optimization
+    # Parameterize R_pre as a rotation (3 parameters: axis-angle)
+    print("  Refining with continuous optimization...")
+
+    def objective(rotvec):
+        R_pre = Rotation.from_rotvec(rotvec).as_matrix()
+        rms, _ = compute_rms_error(R_pre)
+        return rms
+
+    # Start from best permutation (convert to axis-angle)
+    init_rotvec = Rotation.from_matrix(best_P).as_rotvec()
+
+    result = minimize(
+        objective,
+        init_rotvec,
+        method='Powell',
+        options={'maxiter': 500, 'ftol': 1e-8}
+    )
+
+    R_pre_opt = Rotation.from_rotvec(result.x).as_matrix()
+    rms_opt, R_offset_opt = compute_rms_error(R_pre_opt)
+
+    print(f"  Optimized RMS error: {rms_opt * 180 / np.pi:.2f} deg")
+    print("  Optimized R_pre:")
+    print(f"    [{R_pre_opt[0, 0]:6.3f}, {R_pre_opt[0, 1]:6.3f}, {R_pre_opt[0, 2]:6.3f}]")
+    print(f"    [{R_pre_opt[1, 0]:6.3f}, {R_pre_opt[1, 1]:6.3f}, {R_pre_opt[1, 2]:6.3f}]")
+    print(f"    [{R_pre_opt[2, 0]:6.3f}, {R_pre_opt[2, 1]:6.3f}, {R_pre_opt[2, 2]:6.3f}]")
+    print(f"  Residual offset (xyz): {R_offset_opt.as_euler('xyz', degrees=True)} deg")
+
+    # Step 3: Also try simple left-multiply for comparison
+    print("  Comparing with simple left-multiply...")
     relative_rotations = []
-    for april_q, odom_q in zip(april_quats, odom_quats):
-        r_april = Rotation.from_quat(april_q)
-        r_odom = Rotation.from_quat(odom_q)
-        r_rel = r_odom * r_april.inv()
-        relative_rotations.append(r_rel)
+    for r_april, r_odom in zip(april_rots, odom_rots):
+        r_left = r_odom * r_april.inv()
+        relative_rotations.append(r_left)
 
-    # Average the relative rotations using mean of quaternions
     quats = np.array([r.as_quat() for r in relative_rotations])
-
-    # Handle quaternion sign ambiguity - flip quats to same hemisphere as first
     for i in range(1, len(quats)):
         if np.dot(quats[i], quats[0]) < 0:
             quats[i] = -quats[i]
-
     mean_quat = np.mean(quats, axis=0)
-    mean_quat = mean_quat / np.linalg.norm(mean_quat)  # normalize
+    mean_quat = mean_quat / np.linalg.norm(mean_quat)
+    R_left = Rotation.from_quat(mean_quat)
 
-    return Rotation.from_quat(mean_quat)
+    total_left_err = 0.0
+    for r_april, r_odom in zip(april_rots, odom_rots):
+        r_aligned = R_left * r_april
+        r_diff = r_odom * r_aligned.inv()
+        total_left_err += r_diff.magnitude() ** 2
+    rms_left = np.sqrt(total_left_err / len(april_quats)) * 180 / np.pi
+    print(f"  Left-multiply RMS error: {rms_left:.2f} deg")
+
+    # Choose the best approach
+    rms_opt_deg = rms_opt * 180 / np.pi
+    if rms_opt_deg < rms_left:
+        print(f"  Using optimized similarity transform (better by {rms_left - rms_opt_deg:.2f} deg)")
+        return R_offset_opt, R_pre_opt
+    else:
+        print(f"  Using left-multiply (better by {rms_opt_deg - rms_left:.2f} deg)")
+        return R_left, np.eye(3)
 
 
 def find_time_offset(
