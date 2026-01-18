@@ -44,15 +44,6 @@ def plot_comparison(comparison: dict):
     # Normalize timestamps to start at 0
     t = timestamps - timestamps[0]
 
-    # Convert quaternions to euler angles (in degrees)
-    april_euler = np.array([Rotation.from_quat(q).as_euler('xyz', degrees=True) for q in april_quats])
-    odom_euler = np.array([Rotation.from_quat(q).as_euler('xyz', degrees=True) for q in odom_quats])
-
-    # Compute euler angle errors (handle wraparound at +/-180)
-    euler_errors = april_euler - odom_euler
-    # Wrap to [-180, 180]
-    euler_errors = np.mod(euler_errors + 180, 360) - 180
-
     # Position plots
     fig1, axes1 = plt.subplots(2, 2, figsize=(12, 10))
     fig1.suptitle('Position Comparison', fontsize=14)
@@ -93,46 +84,85 @@ def plot_comparison(comparison: dict):
 
     plt.tight_layout()
 
-    # Orientation plots
+    # Orientation plots - using meaningful representations instead of raw Euler angles
     fig2, axes2 = plt.subplots(2, 2, figsize=(12, 10))
-    fig2.suptitle('Orientation Comparison (Euler XYZ)', fontsize=14)
+    fig2.suptitle('Orientation Comparison', fontsize=14)
 
-    # Roll (X rotation) over time
-    axes2[0, 0].plot(t, april_euler[:, 0], 'b-', label='AprilTag', alpha=0.7)
-    axes2[0, 0].plot(t, odom_euler[:, 0], 'r--', label='Odometry', alpha=0.7)
+    # 1. Rotation error over time (angular difference - the actual tracking quality)
+    angle_errors = []
+    for april_q, odom_q in zip(april_quats, odom_quats):
+        r_april = Rotation.from_quat(april_q)
+        r_odom = Rotation.from_quat(odom_q)
+        r_diff = r_odom.inv() * r_april
+        angle_errors.append(np.abs(r_diff.magnitude()) * 180 / np.pi)
+    angle_errors = np.array(angle_errors)
+
+    axes2[0, 0].plot(t, angle_errors, 'g-', alpha=0.7)
+    axes2[0, 0].axhline(y=np.mean(angle_errors), color='r', linestyle='--',
+                        label=f'Mean: {np.mean(angle_errors):.1f}°')
     axes2[0, 0].set_xlabel('Time (s)')
-    axes2[0, 0].set_ylabel('Roll (deg)')
-    axes2[0, 0].set_title('Roll (X rotation)')
+    axes2[0, 0].set_ylabel('Angular Error (deg)')
+    axes2[0, 0].set_title('Rotation Error (geodesic distance)')
     axes2[0, 0].legend()
     axes2[0, 0].grid(True)
 
-    # Pitch (Y rotation) over time
-    axes2[0, 1].plot(t, april_euler[:, 1], 'b-', label='AprilTag', alpha=0.7)
-    axes2[0, 1].plot(t, odom_euler[:, 1], 'r--', label='Odometry', alpha=0.7)
+    # 2. Angular velocity comparison (frame-to-frame rotation changes)
+    # This shows if tracking follows rotational motion correctly
+    april_ang_vel = []
+    odom_ang_vel = []
+    for i in range(1, len(april_quats)):
+        r_april_prev = Rotation.from_quat(april_quats[i-1])
+        r_april_curr = Rotation.from_quat(april_quats[i])
+        r_odom_prev = Rotation.from_quat(odom_quats[i-1])
+        r_odom_curr = Rotation.from_quat(odom_quats[i])
+
+        # Angular change magnitude (degrees)
+        april_delta = (r_april_curr * r_april_prev.inv()).magnitude() * 180 / np.pi
+        odom_delta = (r_odom_curr * r_odom_prev.inv()).magnitude() * 180 / np.pi
+        april_ang_vel.append(april_delta)
+        odom_ang_vel.append(odom_delta)
+
+    april_ang_vel = np.array(april_ang_vel)
+    odom_ang_vel = np.array(odom_ang_vel)
+    t_vel = t[1:]  # One less point for velocities
+
+    axes2[0, 1].plot(t_vel, april_ang_vel, 'b-', label='AprilTag', alpha=0.7)
+    axes2[0, 1].plot(t_vel, odom_ang_vel, 'r--', label='Odometry', alpha=0.7)
     axes2[0, 1].set_xlabel('Time (s)')
-    axes2[0, 1].set_ylabel('Pitch (deg)')
-    axes2[0, 1].set_title('Pitch (Y rotation)')
+    axes2[0, 1].set_ylabel('Angular Change (deg/frame)')
+    axes2[0, 1].set_title('Frame-to-Frame Rotation Magnitude')
     axes2[0, 1].legend()
     axes2[0, 1].grid(True)
 
-    # Yaw (Z rotation) over time
-    axes2[1, 0].plot(t, april_euler[:, 2], 'b-', label='AprilTag', alpha=0.7)
-    axes2[1, 0].plot(t, odom_euler[:, 2], 'r--', label='Odometry', alpha=0.7)
-    axes2[1, 0].set_xlabel('Time (s)')
-    axes2[1, 0].set_ylabel('Yaw (deg)')
-    axes2[1, 0].set_title('Yaw (Z rotation)')
+    # 3. Rotation speed scatter plot (invariant activity correlation)
+    # If points cluster along diagonal, tracking follows motion correctly
+    # This is coordinate-frame independent
+    axes2[1, 0].scatter(odom_ang_vel, april_ang_vel, alpha=0.5, s=10)
+    # Add diagonal reference line
+    max_vel = max(np.max(april_ang_vel), np.max(odom_ang_vel))
+    axes2[1, 0].plot([0, max_vel], [0, max_vel], 'r--', alpha=0.5, label='Perfect match')
+    # Compute correlation
+    if len(april_ang_vel) > 2:
+        corr = np.corrcoef(april_ang_vel, odom_ang_vel)[0, 1]
+        axes2[1, 0].set_title(f'Activity Correlation (r={corr:.3f})')
+    else:
+        axes2[1, 0].set_title('Activity Correlation')
+    axes2[1, 0].set_xlabel('Odom Rotation Speed (deg/frame)')
+    axes2[1, 0].set_ylabel('AprilTag Rotation Speed (deg/frame)')
     axes2[1, 0].legend()
     axes2[1, 0].grid(True)
+    axes2[1, 0].set_aspect('equal', adjustable='box')
 
-    # Euler angle errors over time
-    axes2[1, 1].plot(t, euler_errors[:, 0], 'r-', label='Roll err', alpha=0.7)
-    axes2[1, 1].plot(t, euler_errors[:, 1], 'g-', label='Pitch err', alpha=0.7)
-    axes2[1, 1].plot(t, euler_errors[:, 2], 'b-', label='Yaw err', alpha=0.7)
+    # 4. Cumulative rotation (total degrees traveled)
+    # This is invariant - shows if both systems "traveled" the same rotational distance
+    april_cumulative = np.concatenate([[0], np.cumsum(april_ang_vel)])
+    odom_cumulative = np.concatenate([[0], np.cumsum(odom_ang_vel)])
+
+    axes2[1, 1].plot(t, april_cumulative, 'b-', label='AprilTag', alpha=0.7)
+    axes2[1, 1].plot(t, odom_cumulative, 'r--', label='Odometry', alpha=0.7)
     axes2[1, 1].set_xlabel('Time (s)')
-    axes2[1, 1].set_ylabel('Error (deg)')
-    axes2[1, 1].set_title(f'Euler Angle Errors (RMS: R={np.sqrt(np.mean(euler_errors[:, 0]**2)):.1f}, '
-                          f'P={np.sqrt(np.mean(euler_errors[:, 1]**2)):.1f}, '
-                          f'Y={np.sqrt(np.mean(euler_errors[:, 2]**2)):.1f} deg)')
+    axes2[1, 1].set_ylabel('Cumulative Rotation (deg)')
+    axes2[1, 1].set_title('Total Rotation Traveled')
     axes2[1, 1].legend()
     axes2[1, 1].grid(True)
 
@@ -160,9 +190,8 @@ def visualize_on_frames(
     matched_odom: list[dict],
     tracker: AprilTagTracker,
     R: np.ndarray,
-    scale: float,
     t: np.ndarray,
-    R_rot_align: tuple,
+    R_rot_align: np.ndarray | None,
     output_path: Optional[str] = None,
 ):
     """
@@ -173,10 +202,9 @@ def visualize_on_frames(
     Green line: Error between them
     """
     # To project odometry back to image, we need the inverse transform
-    # april_aligned = scale * (R @ april_raw) + t  =>  odom frame
-    # To go from odom to april_raw: april_raw = R.T @ (odom - t) / scale
+    # april_aligned = R @ april_raw + t  =>  odom frame
+    # To go from odom to april_raw: april_raw = R.T @ (odom - t)
     R_inv = R.T
-    scale_inv = 1.0 / scale
 
     height, width = zed_frames[0]['frame'].shape[:2]
     fps = 30
@@ -205,7 +233,7 @@ def visualize_on_frames(
 
             # Transform odom position back to robot frame (same as april)
             odom_pos = odom['position']
-            odom_robot = R_inv @ (odom_pos - t) * scale_inv
+            odom_robot = R_inv @ (odom_pos - t)
 
             # Transform from robot frame to camera frame for projection
             # Robot frame (from tracker.py): X=forward (toward camera), Y=left, Z=up
@@ -340,7 +368,7 @@ def visualize_on_frames(
                 cv2.circle(frame, (odom_x, odom_y), 14, (0, 0, 0), 2)
 
                 # Compute and display errors (XYZ)
-                april_aligned = scale * (R @ april_robot) + t
+                april_aligned = R @ april_robot + t
                 pos_error = np.linalg.norm(april_aligned - odom_pos) * 100  # cm
 
                 # Compute angle error (using aligned rotations in world frame)

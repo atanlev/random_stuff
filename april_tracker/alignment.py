@@ -11,56 +11,58 @@ def compute_alignment_transform(
     odom_positions: np.ndarray,
     outlier_threshold: float = 0.5,
     max_iterations: int = 3,
-) -> tuple[np.ndarray, float, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute rotation, scale, and translation to align AprilTag coords to odometry coords.
+    Compute RIGID rotation and translation (Scale=1.0) to align AprilTag coords to odometry coords.
     Uses Kabsch algorithm with iterative outlier removal.
 
     Returns:
-        R: 3x3 rotation matrix
-        scale: scale factor
+        R: 3x3 rotation matrix (this IS the axis mapping)
         t: 3x1 translation vector
         inlier_mask: boolean array indicating inliers
-    Such that: odom_pos ≈ scale * (R @ april_pos) + t
+    Such that: odom_pos ≈ R @ april_pos + t
     """
     inlier_mask = np.ones(len(april_positions), dtype=bool)
+
+    R = np.eye(3)
+    t = np.zeros(3)
 
     for iteration in range(max_iterations):
         april_inliers = april_positions[inlier_mask]
         odom_inliers = odom_positions[inlier_mask]
 
+        if len(april_inliers) < 3:
+            print("Warning: Not enough inliers for alignment.")
+            break
+
+        # 1. Centroids
         april_mean = np.mean(april_inliers, axis=0)
         odom_mean = np.mean(odom_inliers, axis=0)
 
+        # 2. Center the points
         april_centered = april_inliers - april_mean
         odom_centered = odom_inliers - odom_mean
 
-        # Compute covariance matrix
+        # 3. Covariance Matrix
         H = april_centered.T @ odom_centered
 
-        # SVD
+        # 4. SVD for Rotation
         U, S, Vt = np.linalg.svd(H)
-
-        # Compute rotation
         R = Vt.T @ U.T
 
-        # Handle reflection case
+        # 5. Handle Reflection (ensure proper rotation, det(R)=1)
         if np.linalg.det(R) < 0:
             Vt[-1, :] *= -1
             R = Vt.T @ U.T
 
-        # Compute scale
-        april_rotated = (R @ april_centered.T).T
-        scale = np.linalg.norm(odom_centered) / np.linalg.norm(april_rotated)
+        # 6. Compute Translation (RIGID: scale = 1.0)
+        t = odom_mean - R @ april_mean
 
-        # Compute translation
-        t = odom_mean - scale * (R @ april_mean)
-
-        # Compute residuals for all points (XYZ)
-        april_transformed = scale * (R @ april_positions.T).T + t
+        # 7. Compute residuals for all points
+        april_transformed = (R @ april_positions.T).T + t
         residuals = np.linalg.norm(april_transformed - odom_positions, axis=1)
 
-        # Update inlier mask
+        # 8. Update inlier mask
         new_inlier_mask = residuals < outlier_threshold
         n_outliers = np.sum(~new_inlier_mask)
 
@@ -73,152 +75,89 @@ def compute_alignment_transform(
 
         inlier_mask = new_inlier_mask
 
-    return R, scale, t, inlier_mask
+    return R, t, inlier_mask
 
 
 def compute_rotation_alignment(
     april_quats: list[np.ndarray],
     odom_quats: list[np.ndarray],
-) -> tuple[Rotation, np.ndarray]:
+) -> np.ndarray:
     """
     Compute rotation alignment between AprilTag and odometry orientations.
 
-    Uses iterative optimization to find R_pre such that:
-        R_odom ≈ R_offset @ R_pre @ R_april @ R_pre.T
-
-    The R_pre matrix is found by searching over all 24 axis permutations,
-    then refined using gradient-free optimization.
+    Uses Kabsch algorithm on rotation matrices to find the optimal
+    rotation R such that: R_odom ≈ R_align @ R_april
 
     Returns:
-        R_offset: Residual rotation offset
-        R_pre: 3x3 pre-multiplication matrix for similarity transform
+        R_align: 3x3 rotation matrix for alignment
     """
-    from scipy.optimize import minimize
-
     april_rots = [Rotation.from_quat(q) for q in april_quats]
     odom_rots = [Rotation.from_quat(q) for q in odom_quats]
 
-    def compute_rms_error(R_pre, R_offset=None):
-        """Compute RMS angular error for given R_pre (and optionally R_offset)."""
-        if R_offset is None:
-            # Compute optimal offset for this R_pre
-            relative_rots = []
-            for r_april, r_odom in zip(april_rots, odom_rots):
-                R_sim = R_pre @ r_april.as_matrix() @ R_pre.T
-                r_sim = Rotation.from_matrix(R_sim)
-                r_rel = r_odom * r_sim.inv()
-                relative_rots.append(r_rel)
+    # Convert to rotation matrices
+    april_mats = np.array([r.as_matrix() for r in april_rots])
+    odom_mats = np.array([r.as_matrix() for r in odom_rots])
 
-            quats = np.array([r.as_quat() for r in relative_rots])
-            for i in range(1, len(quats)):
-                if np.dot(quats[i], quats[0]) < 0:
-                    quats[i] = -quats[i]
-            mean_quat = np.mean(quats, axis=0)
-            mean_quat = mean_quat / np.linalg.norm(mean_quat)
-            R_offset = Rotation.from_quat(mean_quat)
+    # Use Kabsch on the rotation matrices
+    # We want to find R_align such that R_odom ≈ R_align @ R_april
+    # This is equivalent to finding R_align that minimizes ||R_odom - R_align @ R_april||
+    #
+    # Using the Frobenius norm and averaging over all samples:
+    # H = sum(R_odom @ R_april.T) = sum of cross-covariance
+    H = np.zeros((3, 3))
+    for r_april, r_odom in zip(april_mats, odom_mats):
+        H += r_odom @ r_april.T
 
-        total_err = 0.0
-        for r_april, r_odom in zip(april_rots, odom_rots):
-            R_sim = R_pre @ r_april.as_matrix() @ R_pre.T
-            r_sim = Rotation.from_matrix(R_sim)
-            r_aligned = R_offset * r_sim
-            r_diff = r_odom * r_aligned.inv()
-            total_err += r_diff.magnitude() ** 2
+    # SVD to find optimal rotation
+    U, S, Vt = np.linalg.svd(H)
+    R_align = U @ Vt
 
-        return np.sqrt(total_err / len(april_quats)), R_offset
+    # Handle reflection
+    if np.linalg.det(R_align) < 0:
+        Vt[-1, :] *= -1
+        R_align = U @ Vt
 
-    # Step 1: Try all 24 proper rotations (axis permutations)
-    print("  Searching over 24 axis permutations...")
-    best_perm_error = float('inf')
-    best_P = np.eye(3)
+    # Print axis mapping interpretation
+    print("\n  Rotation alignment (R_align @ R_april = R_odom):")
+    _print_axis_mapping(R_align)
 
-    axis_permutations = [
-        [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]
-    ]
-    sign_combos = [
-        [1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]
-    ]
-
-    for perm in axis_permutations:
-        for signs in sign_combos:
-            P = np.zeros((3, 3))
-            for i, (p, s) in enumerate(zip(perm, signs)):
-                P[i, p] = s
-
-            if np.linalg.det(P) < 0:
-                continue
-
-            rms, _ = compute_rms_error(P)
-            if rms < best_perm_error:
-                best_perm_error = rms
-                best_P = P.copy()
-
-    print(f"  Best axis permutation RMS error: {best_perm_error * 180 / np.pi:.2f} deg")
-    print("  Best permutation matrix P:")
-    print(f"    [{best_P[0, 0]:6.3f}, {best_P[0, 1]:6.3f}, {best_P[0, 2]:6.3f}]")
-    print(f"    [{best_P[1, 0]:6.3f}, {best_P[1, 1]:6.3f}, {best_P[1, 2]:6.3f}]")
-    print(f"    [{best_P[2, 0]:6.3f}, {best_P[2, 1]:6.3f}, {best_P[2, 2]:6.3f}]")
-
-    # Step 2: Refine using continuous optimization
-    # Parameterize R_pre as a rotation (3 parameters: axis-angle)
-    print("  Refining with continuous optimization...")
-
-    def objective(rotvec):
-        R_pre = Rotation.from_rotvec(rotvec).as_matrix()
-        rms, _ = compute_rms_error(R_pre)
-        return rms
-
-    # Start from best permutation (convert to axis-angle)
-    init_rotvec = Rotation.from_matrix(best_P).as_rotvec()
-
-    result = minimize(
-        objective,
-        init_rotvec,
-        method='Powell',
-        options={'maxiter': 500, 'ftol': 1e-8}
-    )
-
-    R_pre_opt = Rotation.from_rotvec(result.x).as_matrix()
-    rms_opt, R_offset_opt = compute_rms_error(R_pre_opt)
-
-    print(f"  Optimized RMS error: {rms_opt * 180 / np.pi:.2f} deg")
-    print("  Optimized R_pre:")
-    print(f"    [{R_pre_opt[0, 0]:6.3f}, {R_pre_opt[0, 1]:6.3f}, {R_pre_opt[0, 2]:6.3f}]")
-    print(f"    [{R_pre_opt[1, 0]:6.3f}, {R_pre_opt[1, 1]:6.3f}, {R_pre_opt[1, 2]:6.3f}]")
-    print(f"    [{R_pre_opt[2, 0]:6.3f}, {R_pre_opt[2, 1]:6.3f}, {R_pre_opt[2, 2]:6.3f}]")
-    print(f"  Residual offset (xyz): {R_offset_opt.as_euler('xyz', degrees=True)} deg")
-
-    # Step 3: Also try simple left-multiply for comparison
-    print("  Comparing with simple left-multiply...")
-    relative_rotations = []
+    # Compute alignment error
+    errors = []
     for r_april, r_odom in zip(april_rots, odom_rots):
-        r_left = r_odom * r_april.inv()
-        relative_rotations.append(r_left)
-
-    quats = np.array([r.as_quat() for r in relative_rotations])
-    for i in range(1, len(quats)):
-        if np.dot(quats[i], quats[0]) < 0:
-            quats[i] = -quats[i]
-    mean_quat = np.mean(quats, axis=0)
-    mean_quat = mean_quat / np.linalg.norm(mean_quat)
-    R_left = Rotation.from_quat(mean_quat)
-
-    total_left_err = 0.0
-    for r_april, r_odom in zip(april_rots, odom_rots):
-        r_aligned = R_left * r_april
+        r_aligned = Rotation.from_matrix(R_align) * r_april
         r_diff = r_odom * r_aligned.inv()
-        total_left_err += r_diff.magnitude() ** 2
-    rms_left = np.sqrt(total_left_err / len(april_quats)) * 180 / np.pi
-    print(f"  Left-multiply RMS error: {rms_left:.2f} deg")
+        errors.append(r_diff.magnitude() * 180 / np.pi)
 
-    # Choose the best approach
-    rms_opt_deg = rms_opt * 180 / np.pi
-    if rms_opt_deg < rms_left:
-        print(f"  Using optimized similarity transform (better by {rms_left - rms_opt_deg:.2f} deg)")
-        return R_offset_opt, R_pre_opt
-    else:
-        print(f"  Using left-multiply (better by {rms_opt_deg - rms_left:.2f} deg)")
-        return R_left, np.eye(3)
+    errors = np.array(errors)
+    print(f"\n  Alignment error: mean={np.mean(errors):.2f}°, std={np.std(errors):.2f}°, max={np.max(errors):.2f}°")
+
+    return R_align
+
+
+def _print_axis_mapping(R: np.ndarray) -> None:
+    """
+    Interprets the rotation matrix to show which axis maps to which.
+    R @ v_april = v_odom
+    The columns of R represent the AprilTag axes expressed in Odom frame.
+    """
+    axes_names = ['X (Roll)', 'Y (Pitch)', 'Z (Yaw)']
+
+    print("  Axis Mapping (AprilTag -> Odometry):")
+
+    # Check columns of R (AprilTag axes -> Odom frame)
+    for i in range(3):
+        # Find which row (Odom axis) has the strongest magnitude
+        odom_axis_idx = np.argmax(np.abs(R[:, i]))
+        sign = np.sign(R[odom_axis_idx, i])
+        strength = np.abs(R[odom_axis_idx, i])
+        sign_str = "+" if sign > 0 else "-"
+
+        print(f"    April {axes_names[i]:12} -> {sign_str}Odom {axes_names[odom_axis_idx]:12} (strength: {strength:.3f})")
+
+    # Check determinant
+    det = np.linalg.det(R)
+    if abs(det - 1.0) > 1e-3:
+        print(f"  WARNING: Matrix is not a proper rotation (det={det:.3f})")
 
 
 def find_time_offset(

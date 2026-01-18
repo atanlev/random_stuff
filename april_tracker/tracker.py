@@ -94,7 +94,7 @@ class AprilTagTracker:
 
         # solvePnP gives R_camera = rotation of TAG in CAMERA frame
         # We want the robot's orientation, which is the INVERSE (camera in tag frame)
-        # Then we need to account for the camera facing the robot
+        # The actual coordinate frame alignment is handled by compute_rotation_alignment()
         R_robot = R_camera.T  # Transpose = inverse for rotation matrix
 
         return Pose(position=t_robot, rotation=R_robot)

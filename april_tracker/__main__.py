@@ -13,13 +13,15 @@ def main():
                         help="Disable automatic time offset detection")
     parser.add_argument("--time-offset-ms", type=float, default=None,
                         help="Manual time offset in milliseconds (overrides auto-detection)")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Skip visualization (just show stats)")
     args = parser.parse_args()
 
     zed_frames_path = ZED_FRAMES_PATH
     walk_log_path = WALK_LOG_PATH
 
     print("Loading data...")
-    zed_frames = load_zed_frames(zed_frames_path)
+    zed_frames, intrinsics = load_zed_frames(zed_frames_path)
     walk_log = load_walk_log(walk_log_path, frame_filter=ODOM_FRAME)
 
     if ODOM_FRAME is not None:
@@ -37,26 +39,27 @@ def main():
     else:
         time_offset_s = None  # Auto-detect
 
-    tracker = create_tracker()
-    april_results, matched_odom, frames_used, R, scale, t, R_rot_align, time_offset = process_frames(
+    tracker = create_tracker(intrinsics)
+    april_results, matched_odom, frames_used, R, t, R_rot_align, time_offset = process_frames(
         zed_frames, walk_log, tracker, time_offset_s=time_offset_s
     )
     print(f"\nTime offset applied: {time_offset * 1000:.1f} ms")
 
     # Search for best tag-to-baselink offset
     print("\nSearching for optimal tag-to-baselink offset...")
-    best_offset = find_best_offset(april_results, matched_odom, R, scale, t, R_rot_align)
+    best_offset = find_best_offset(april_results, matched_odom, R, t, R_rot_align)
 
-    comparison = compare_positions(april_results, matched_odom, R, scale, t, R_rot_align,
+    comparison = compare_positions(april_results, matched_odom, R, t, R_rot_align,
                                    tag_offset=best_offset)
 
-    plot_comparison(comparison)
+    if not args.no_viz:
+        plot_comparison(comparison)
 
-    # Visualize on RGB frames (using only frames that overlap with odometry)
-    visualize_on_frames(
-        frames_used, april_results, matched_odom, tracker,
-        R, scale, t, R_rot_align, output_path="april_vs_odom.mp4"
-    )
+        # Visualize on RGB frames (using only frames that overlap with odometry)
+        visualize_on_frames(
+            frames_used, april_results, matched_odom, tracker,
+            R, t, R_rot_align, output_path="april_vs_odom.mp4"
+        )
 
 
 if __name__ == "__main__":

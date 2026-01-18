@@ -6,7 +6,8 @@ from .tracker_io import load_zed_frames, load_walk_log, find_closest_odom
 from .processing import process_frames, compare_positions
 from .visualization import plot_comparison, visualize_on_frames
 from .config import (
-    create_tracker, TAG_SIZE_M, RIGID_BODIES, CAMERA_MATRIX, DIST_COEFFS,
+    create_tracker, get_camera_params, TAG_SIZE_M, RIGID_BODIES,
+    DEFAULT_CAMERA_MATRIX, DEFAULT_DIST_COEFFS,
     APRILTAG_TO_BASELINK_OFFSET, AUTO_TIME_OFFSET, ZED_FRAMES_PATH, WALK_LOG_PATH
 )
 
@@ -33,10 +34,11 @@ __all__ = [
     'visualize_on_frames',
     # Config
     'create_tracker',
+    'get_camera_params',
     'TAG_SIZE_M',
     'RIGID_BODIES',
-    'CAMERA_MATRIX',
-    'DIST_COEFFS',
+    'DEFAULT_CAMERA_MATRIX',
+    'DEFAULT_DIST_COEFFS',
     'APRILTAG_TO_BASELINK_OFFSET',
     'AUTO_TIME_OFFSET',
     'ZED_FRAMES_PATH',

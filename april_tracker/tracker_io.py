@@ -5,10 +5,24 @@ import pickle
 from typing import Optional
 
 
-def load_zed_frames(pkl_path: str) -> list[dict]:
-    """Load zed_frames.pkl - list of {'timestamp': float, 'frame': np.ndarray}"""
+def load_zed_frames(pkl_path: str) -> tuple[list[dict], Optional[dict]]:
+    """Load zed_frames.pkl - list of {'timestamp': float, 'frame': np.ndarray}
+
+    Returns:
+        frames: List of frame dictionaries
+        intrinsics: Camera intrinsics dict with fx, fy, cx, cy, k1-k3, p1-p2, or None if not available
+    """
     with open(pkl_path, 'rb') as f:
-        return pickle.load(f)
+        data = pickle.load(f)
+
+    # Handle both old format (list) and new format (dict with 'frames' and 'intrinsics')
+    if isinstance(data, dict) and 'frames' in data:
+        frames = data['frames']
+        intrinsics = data.get('intrinsics', None)
+        return frames, intrinsics
+    else:
+        # Old format - just a list of frames
+        return data, None
 
 
 def load_walk_log(pkl_path: str, frame_filter: Optional[str] = None) -> list[dict]:

@@ -22,6 +22,22 @@ runtime_parameters = sl.RuntimeParameters()
 # Prepare a single image container
 image = sl.Mat()
 
+# Get camera intrinsics
+calibration_params = zed.get_camera_information().camera_configuration.calibration_parameters
+left_cam = calibration_params.left_cam
+intrinsics = {
+    'fx': left_cam.fx,
+    'fy': left_cam.fy,
+    'cx': left_cam.cx,
+    'cy': left_cam.cy,
+    'k1': left_cam.disto[0] if len(left_cam.disto) > 0 else 0.0,
+    'k2': left_cam.disto[1] if len(left_cam.disto) > 1 else 0.0,
+    'p1': left_cam.disto[2] if len(left_cam.disto) > 2 else 0.0,
+    'p2': left_cam.disto[3] if len(left_cam.disto) > 3 else 0.0,
+    'k3': left_cam.disto[4] if len(left_cam.disto) > 4 else 0.0,
+}
+print(f"Camera intrinsics: fx={intrinsics['fx']:.2f}, fy={intrinsics['fy']:.2f}, cx={intrinsics['cx']:.2f}, cy={intrinsics['cy']:.2f}")
+
 # List to store frames with timestamps
 frames_data = []
 
@@ -61,9 +77,13 @@ while True:
 zed.close()
 cv2.destroyAllWindows()
 
-# Save frames with timestamps to pickle file
+# Save frames with timestamps and intrinsics to pickle file
 print(f"Saving {len(frames_data)} frames to pickle file...")
+output_data = {
+    'frames': frames_data,
+    'intrinsics': intrinsics,
+}
 with open(pickle_file_path, 'wb') as f:
-    pickle.dump(frames_data, f)
+    pickle.dump(output_data, f)
 
 print(f"Captured {len(frames_data)} frames and saved to {pickle_file_path}")

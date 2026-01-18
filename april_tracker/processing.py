@@ -36,10 +36,10 @@ def process_frames(
     walk_log: list[dict],
     tracker: AprilTagTracker,
     time_offset_s: float | None = None,
-) -> tuple[list[FrameResult], list[dict], list[dict], np.ndarray, float, np.ndarray, Rotation, float]:
+) -> tuple[list[FrameResult], list[dict], list[dict], np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Process frames from zed_frames.pkl that overlap with walk_log odometry.
-    Computes direct transformation from camera frame to odometry frame.
+    Computes rigid transformation from camera frame to odometry frame.
     Stops when frames go beyond odometry time range.
 
     Args:
@@ -53,9 +53,8 @@ def process_frames(
         matched_odom: Corresponding odometry data (absolute positions) for each frame
         frames_used: The subset of zed_frames that were processed
         R: Rotation matrix to transform camera frame to odometry frame
-        scale: Scale factor
-        t: Translation vector (camera_to_odom: odom_pos = scale * R @ camera_pos + t)
-        R_rot_align: Rotation to align AprilTag orientations to odometry
+        t: Translation vector (camera_to_odom: odom_pos = R @ camera_pos + t)
+        R_rot_align: 3x3 rotation matrix to align AprilTag orientations to odometry
         time_offset_s: The time offset used (auto-detected or provided)
     """
     # Find first frame where walk_log has data (timestamps overlap)
@@ -162,7 +161,7 @@ def process_frames(
     print(f"Processed {len(april_results)} frames")
 
     # Detect stationary frames using odometry velocity
-    stationary_threshold = 0.02  # m/s - below this is considered stationary
+    stationary_threshold = 0.2  # m/s - below this is considered stationary
 
     stationary_april_pos = []
     stationary_odom_pos = []
@@ -244,38 +243,34 @@ def process_frames(
     if len(stationary_april_pos) < 10:
         print("Warning: Not enough stationary frames for alignment, using identity transform")
         R = np.eye(3)
-        scale = 1.0
         t = np.zeros(3)
-        R_rot_align = (Rotation.identity(), np.eye(3))  # (offset, remap)
+        R_rot_align = None  # No rotation alignment
     else:
         stationary_april_pos = np.array(stationary_april_pos)
         stationary_odom_pos = np.array(stationary_odom_pos)
 
-        R, scale, t, inlier_mask = compute_alignment_transform(stationary_april_pos, stationary_odom_pos)
+        R, t, inlier_mask = compute_alignment_transform(stationary_april_pos, stationary_odom_pos)
         n_inliers = np.sum(inlier_mask)
         n_outliers = len(inlier_mask) - n_inliers
         print("Position alignment transform computed from stationary frames:")
         print(f"  Inliers: {n_inliers}, Outliers removed: {n_outliers}")
-        print(f"  Scale: {scale:.4f}")
         print(f"  Translation: {t}")
 
         # Compute rotation alignment using inlier stationary frames
         inlier_april_quats = [q for q, m in zip(stationary_april_quats, inlier_mask) if m]
         inlier_odom_quats = [q for q, m in zip(stationary_odom_quats, inlier_mask) if m]
-        R_rot_offset, R_axis_remap = compute_rotation_alignment(inlier_april_quats, inlier_odom_quats)
-        R_rot_align = (R_rot_offset, R_axis_remap)  # Pack as tuple
-        print(f"Rotation offset: {R_rot_offset.as_euler('xyz', degrees=True)} (euler xyz deg)")
+        euler_map = compute_rotation_alignment(inlier_april_quats, inlier_odom_quats)
+        R_rot_align = euler_map  # Just the euler map now
 
-    return april_results, matched_odom, frames_used, R, scale, t, R_rot_align, time_offset_s
+    return april_results, matched_odom, frames_used, R, t, R_rot_align, time_offset_s
 
 
 def find_best_offset(
     april_results: list,
     matched_odom: list,
     R: np.ndarray,
-    scale: float,
     t: np.ndarray,
-    R_rot_align: tuple,
+    R_rot_align: np.ndarray,
     search_range: float = 0.15,  # Search +/- 15cm
     step: float = 0.02,  # 2cm steps
 ) -> np.ndarray:
@@ -303,7 +298,7 @@ def find_best_offset(
                     continue
 
                 april_pos_raw = base_link_pose.position
-                april_aligned_before_offset = scale * (R @ april_pos_raw) + t
+                april_aligned_before_offset = R @ april_pos_raw + t
 
                 april_rot = Rotation.from_matrix(base_link_pose.rotation)
                 april_rot_aligned = apply_rotation_alignment(april_rot, R_rot_align)
@@ -327,49 +322,36 @@ def find_best_offset(
     return best_offset
 
 
-def apply_rotation_alignment(april_rot: Rotation, R_rot_align: tuple) -> Rotation:
+def apply_rotation_alignment(april_rot: Rotation, R_align: np.ndarray | None) -> Rotation:
     """
     Apply rotation alignment to an AprilTag rotation.
 
-    The alignment can work in two modes:
-    1. If R_remap is identity: simple left-multiply R_offset @ R_april
-    2. If R_remap is non-identity: similarity transform + offset
-       R_offset @ (R_remap @ R_april @ R_remap.T)
-
     Args:
         april_rot: Raw AprilTag rotation
-        R_rot_align: Tuple of (R_offset, R_remap) where R_offset is a Rotation
-                     and R_remap is a 3x3 numpy array
+        R_align: 3x3 rotation matrix for alignment, or None for identity
 
     Returns:
-        Aligned rotation
+        Aligned rotation: R_align @ R_april
     """
-    R_offset, R_remap = R_rot_align
+    if R_align is None:
+        return april_rot
 
-    # Check if R_remap is identity (left-multiply mode)
-    if np.allclose(R_remap, np.eye(3)):
-        # Simple left-multiply: R_aligned = R_offset @ R_april
-        return R_offset * april_rot
-    else:
-        # Similarity transform mode: R_aligned = R_offset @ (R_remap @ R_april @ R_remap.T)
-        R_remapped = R_remap @ april_rot.as_matrix() @ R_remap.T
-        april_rot_remapped = Rotation.from_matrix(R_remapped)
-        return R_offset * april_rot_remapped
+    # Apply rotation alignment: R_odom = R_align @ R_april
+    return Rotation.from_matrix(R_align) * april_rot
 
 
 def compare_positions(
     april_results: list[FrameResult],
     matched_odom: list[dict],
     R: np.ndarray,
-    scale: float,
     t: np.ndarray,
-    R_rot_align: tuple,
+    R_rot_align: np.ndarray,
     outlier_threshold: float = 0.5,
     tag_offset: np.ndarray = None,
 ) -> dict:
     """
     Compare AprilTag base_link positions and orientations with odometry.
-    Applies alignment transform (rotation, scale, translation) to AprilTag positions.
+    Applies rigid alignment transform (rotation, translation) to AprilTag positions.
     Applies rotation alignment to AprilTag orientations.
     Filters outliers based on error threshold.
 
@@ -397,9 +379,9 @@ def compare_positions(
         if base_link_pose is None:
             continue
 
-        # First align the RAW AprilTag position to world frame
+        # First align the RAW AprilTag position to world frame (rigid: no scale)
         april_pos_raw = base_link_pose.position
-        april_aligned_before_offset = scale * (R @ april_pos_raw) + t
+        april_aligned_before_offset = R @ april_pos_raw + t
 
         # Now apply the offset using the ALIGNED rotation
         # The offset should be rotated by the aligned orientation, not the raw one
@@ -467,143 +449,48 @@ def compare_positions(
     pos_error_norms_filtered = pos_error_norms[inlier_mask]
     angle_errors_filtered = angle_errors[inlier_mask]
 
-    # Filter position and euler data for correlation calculation
+    # Filter position data for correlation calculation
     april_positions_aligned_filtered = april_positions_aligned[inlier_mask]
     odom_positions_filtered = odom_positions[inlier_mask]
-    april_eulers_filtered = april_eulers[inlier_mask]
-    odom_eulers_filtered = odom_eulers[inlier_mask]
 
     # Compute correlation scores for position (X, Y, Z)
     corr_x = np.corrcoef(april_positions_aligned_filtered[:, 0], odom_positions_filtered[:, 0])[0, 1]
     corr_y = np.corrcoef(april_positions_aligned_filtered[:, 1], odom_positions_filtered[:, 1])[0, 1]
     corr_z = np.corrcoef(april_positions_aligned_filtered[:, 2], odom_positions_filtered[:, 2])[0, 1]
 
-    # Compute correlation scores for orientation using quaternions
-    # Quaternions are better than Euler angles (no gimbal lock, no wrapping issues)
+    # Filter quaternion data for rotation metrics
     april_quats_aligned_filtered = april_quats_aligned[inlier_mask]
     odom_quats_filtered = odom_quats[inlier_mask]
 
-    # Compute frame-to-frame angular velocities (rotation differences)
-    # This measures how well the tracker follows rotational changes
-    if len(april_quats_aligned_filtered) > 10:
-        april_angular_vel = []
-        odom_angular_vel = []
+    # Compute INVARIANT metrics (coordinate-frame independent)
+    # These are the metrics that actually matter for tracking quality
 
-        for i in range(1, len(april_quats_aligned_filtered)):
-            # Compute relative rotation between consecutive frames
-            r_april_prev = Rotation.from_quat(april_quats_aligned_filtered[i-1])
-            r_april_curr = Rotation.from_quat(april_quats_aligned_filtered[i])
-            r_odom_prev = Rotation.from_quat(odom_quats_filtered[i-1])
-            r_odom_curr = Rotation.from_quat(odom_quats_filtered[i])
+    # 1. Rotation speed magnitude (scalar - frame independent)
+    april_rot_speed = []
+    odom_rot_speed = []
+    for i in range(1, len(april_quats_aligned_filtered)):
+        r_april_prev = Rotation.from_quat(april_quats_aligned_filtered[i-1])
+        r_april_curr = Rotation.from_quat(april_quats_aligned_filtered[i])
+        r_odom_prev = Rotation.from_quat(odom_quats_filtered[i-1])
+        r_odom_curr = Rotation.from_quat(odom_quats_filtered[i])
 
-            # Angular change between frames
-            april_delta = r_april_curr * r_april_prev.inv()
-            odom_delta = r_odom_curr * r_odom_prev.inv()
+        # Scalar rotation magnitude (degrees per frame)
+        april_rot_speed.append((r_april_curr * r_april_prev.inv()).magnitude() * 180 / np.pi)
+        odom_rot_speed.append((r_odom_curr * r_odom_prev.inv()).magnitude() * 180 / np.pi)
 
-            # Convert to axis-angle to get angular velocity components
-            april_rotvec = april_delta.as_rotvec()  # [rad]
-            odom_rotvec = odom_delta.as_rotvec()
+    april_rot_speed = np.array(april_rot_speed)
+    odom_rot_speed = np.array(odom_rot_speed)
 
-            april_angular_vel.append(april_rotvec)
-            odom_angular_vel.append(odom_rotvec)
-
-        april_angular_vel = np.array(april_angular_vel)
-        odom_angular_vel = np.array(odom_angular_vel)
-
-        # Compute correlation for each axis of angular velocity
-        try:
-            if np.std(april_angular_vel[:, 0]) > 1e-5 and np.std(odom_angular_vel[:, 0]) > 1e-5:
-                corr_wx = np.corrcoef(april_angular_vel[:, 0], odom_angular_vel[:, 0])[0, 1]
-            else:
-                corr_wx = np.nan
-        except (ValueError, RuntimeWarning):
-            corr_wx = np.nan
-
-        try:
-            if np.std(april_angular_vel[:, 1]) > 1e-5 and np.std(odom_angular_vel[:, 1]) > 1e-5:
-                corr_wy = np.corrcoef(april_angular_vel[:, 1], odom_angular_vel[:, 1])[0, 1]
-            else:
-                corr_wy = np.nan
-        except (ValueError, RuntimeWarning):
-            corr_wy = np.nan
-
-        try:
-            if np.std(april_angular_vel[:, 2]) > 1e-5 and np.std(odom_angular_vel[:, 2]) > 1e-5:
-                corr_wz = np.corrcoef(april_angular_vel[:, 2], odom_angular_vel[:, 2])[0, 1]
-            else:
-                corr_wz = np.nan
-        except (ValueError, RuntimeWarning):
-            corr_wz = np.nan
-
-        # Also compute correlation on absolute quaternion components for reference
-        try:
-            corr_qx = np.corrcoef(april_quats_aligned_filtered[:, 0], odom_quats_filtered[:, 0])[0, 1]
-        except (ValueError, RuntimeWarning):
-            corr_qx = np.nan
-        try:
-            corr_qy = np.corrcoef(april_quats_aligned_filtered[:, 1], odom_quats_filtered[:, 1])[0, 1]
-        except (ValueError, RuntimeWarning):
-            corr_qy = np.nan
-        try:
-            corr_qz = np.corrcoef(april_quats_aligned_filtered[:, 2], odom_quats_filtered[:, 2])[0, 1]
-        except (ValueError, RuntimeWarning):
-            corr_qz = np.nan
-        try:
-            corr_qw = np.corrcoef(april_quats_aligned_filtered[:, 3], odom_quats_filtered[:, 3])[0, 1]
-        except (ValueError, RuntimeWarning):
-            corr_qw = np.nan
+    # 2. Rotation speed correlation (activity correlation - invariant)
+    if len(april_rot_speed) > 2 and np.std(april_rot_speed) > 1e-6 and np.std(odom_rot_speed) > 1e-6:
+        rot_speed_corr = np.corrcoef(april_rot_speed, odom_rot_speed)[0, 1]
     else:
-        corr_wx = np.nan
-        corr_wy = np.nan
-        corr_wz = np.nan
-        corr_qx = np.nan
-        corr_qy = np.nan
-        corr_qz = np.nan
-        corr_qw = np.nan
+        rot_speed_corr = np.nan
 
-    # Also compute Euler angles for human-readable variance reporting
-    roll_std_april = np.std(april_eulers_filtered[:, 0])
-    roll_std_odom = np.std(odom_eulers_filtered[:, 0])
-    pitch_std_april = np.std(april_eulers_filtered[:, 1])
-    pitch_std_odom = np.std(odom_eulers_filtered[:, 1])
-    yaw_std_april = np.std(april_eulers_filtered[:, 2])
-    yaw_std_odom = np.std(odom_eulers_filtered[:, 2])
-
-    # Print post-alignment correlation matrix
-    print("\n=== POST-ALIGNMENT AXIS CORRELATION (xyz euler) ===")
-    axis_names = ['Roll (X)', 'Pitch (Y)', 'Yaw (Z)']
-    print("Correlation Matrix (Aligned AprilTag vs Odom):")
-    print(f"{'':12} | {'Odom Roll':>10} {'Odom Pitch':>11} {'Odom Yaw':>10}")
-    print("-" * 50)
-    for i, april_axis in enumerate(axis_names):
-        row = f"{april_axis:12} |"
-        for j in range(3):
-            corr = np.corrcoef(april_eulers_filtered[:, i], odom_eulers_filtered[:, j])[0, 1]
-            row += f" {corr:>10.3f}"
-        print(row)
-
-    # Also try ZYX euler (more common for ground robots - yaw first)
-    april_eulers_zyx = np.array([Rotation.from_quat(q).as_euler('ZYX', degrees=True)
-                                  for q in april_quats_aligned_filtered])
-    odom_eulers_zyx = np.array([Rotation.from_quat(q).as_euler('ZYX', degrees=True)
-                                 for q in odom_quats_filtered])
-    print("\nCorrelation Matrix (ZYX euler - Yaw/Pitch/Roll order):")
-    axis_names_zyx = ['Yaw (Z)', 'Pitch (Y)', 'Roll (X)']
-    print(f"{'':12} | {'Odom Yaw':>10} {'Odom Pitch':>11} {'Odom Roll':>10}")
-    print("-" * 50)
-    for i, april_axis in enumerate(axis_names_zyx):
-        row = f"{april_axis:12} |"
-        for j in range(3):
-            corr = np.corrcoef(april_eulers_zyx[:, i], odom_eulers_zyx[:, j])[0, 1]
-            row += f" {corr:>10.3f}"
-        print(row)
-    print("=" * 50)
-
-    # Map angular velocity correlations to Roll/Pitch/Yaw
-    # This is more meaningful than absolute orientation correlation
-    corr_roll = corr_wx
-    corr_pitch = corr_wy
-    corr_yaw = corr_wz
+    # 3. Cumulative rotation (total degrees traveled)
+    april_cumulative = np.sum(april_rot_speed)
+    odom_cumulative = np.sum(odom_rot_speed)
+    cumulative_ratio = april_cumulative / odom_cumulative if odom_cumulative > 0 else np.nan
 
     # Compute position statistics
     mean_pos_err = np.mean(pos_error_norms_filtered) * 100  # cm
@@ -629,126 +516,56 @@ def compare_positions(
     print(f"50th percentile:   {p50_pos:.1f} cm")
     print(f"90th percentile:   {p90_pos:.1f} cm")
     print(f"99th percentile:   {p99_pos:.1f} cm")
-    print("\nCorrelation scores:")
+    print("\nPosition correlation:")
     print(f"  X: {corr_x:.4f}")
     print(f"  Y: {corr_y:.4f}")
     print(f"  Z: {corr_z:.4f}")
 
-    print("\n=== Orientation Comparison ===")
-    print(f"Mean error:        {mean_angle_err:.1f} deg")
-    print(f"Max error:         {max_angle_err:.1f} deg")
-    print(f"Std:               {std_angle_err:.1f} deg")
-    print(f"50th percentile:   {p50_angle:.1f} deg")
-    print(f"90th percentile:   {p90_angle:.1f} deg")
-    print(f"99th percentile:   {p99_angle:.1f} deg")
-    print("\nOrientation variance (std dev in degrees):")
-    print(f"  Roll:  AprilTag={roll_std_april:.2f}, Odom={roll_std_odom:.2f}")
-    print(f"  Pitch: AprilTag={pitch_std_april:.2f}, Odom={pitch_std_odom:.2f}")
-    print(f"  Yaw:   AprilTag={yaw_std_april:.2f}, Odom={yaw_std_odom:.2f}")
+    print("\n=== Orientation Comparison (Invariant Metrics) ===")
+    print(f"Geodesic Error (total angular difference):")
+    print(f"  Mean:            {mean_angle_err:.1f} deg")
+    print(f"  Std:             {std_angle_err:.1f} deg")
+    print(f"  90th percentile: {p90_angle:.1f} deg")
+    print(f"  Max:             {max_angle_err:.1f} deg")
 
-    # Show range analysis for Euler angles
-    print("\nEuler angle ranges (degrees):")
-    april_roll_min, april_roll_max = np.min(april_eulers_filtered[:, 0]), np.max(april_eulers_filtered[:, 0])
-    april_pitch_min, april_pitch_max = np.min(april_eulers_filtered[:, 1]), np.max(april_eulers_filtered[:, 1])
-    april_yaw_min, april_yaw_max = np.min(april_eulers_filtered[:, 2]), np.max(april_eulers_filtered[:, 2])
-    odom_roll_min, odom_roll_max = np.min(odom_eulers_filtered[:, 0]), np.max(odom_eulers_filtered[:, 0])
-    odom_pitch_min, odom_pitch_max = np.min(odom_eulers_filtered[:, 1]), np.max(odom_eulers_filtered[:, 1])
-    odom_yaw_min, odom_yaw_max = np.min(odom_eulers_filtered[:, 2]), np.max(odom_eulers_filtered[:, 2])
+    print(f"\nRotation Speed (activity check):")
+    print(f"  AprilTag total:  {april_cumulative:.1f} deg")
+    print(f"  Odom total:      {odom_cumulative:.1f} deg")
+    print(f"  Ratio:           {cumulative_ratio:.3f}" if not np.isnan(cumulative_ratio) else "  Ratio:           N/A")
+    print(f"  Speed corr:      {rot_speed_corr:.4f}" if not np.isnan(rot_speed_corr) else "  Speed corr:      N/A")
 
-    april_roll_mean = np.mean(april_eulers_filtered[:, 0])
-    april_pitch_mean = np.mean(april_eulers_filtered[:, 1])
-    april_yaw_mean = np.mean(april_eulers_filtered[:, 2])
-    odom_roll_mean = np.mean(odom_eulers_filtered[:, 0])
-    odom_pitch_mean = np.mean(odom_eulers_filtered[:, 1])
-    odom_yaw_mean = np.mean(odom_eulers_filtered[:, 2])
-
-    print(f"  Roll:  April [{april_roll_min:6.2f}, {april_roll_max:6.2f}] mean={april_roll_mean:6.2f}  "
-          f"Odom [{odom_roll_min:6.2f}, {odom_roll_max:6.2f}] mean={odom_roll_mean:6.2f}")
-    print(f"  Pitch: April [{april_pitch_min:6.2f}, {april_pitch_max:6.2f}] mean={april_pitch_mean:6.2f}  "
-          f"Odom [{odom_pitch_min:6.2f}, {odom_pitch_max:6.2f}] mean={odom_pitch_mean:6.2f}")
-    print(f"  Yaw:   April [{april_yaw_min:6.2f}, {april_yaw_max:6.2f}] mean={april_yaw_mean:6.2f}  "
-          f"Odom [{odom_yaw_min:6.2f}, {odom_yaw_max:6.2f}] mean={odom_yaw_mean:6.2f}")
-
-    # Show angular velocity statistics
-    if len(april_quats_aligned_filtered) > 10:
-        print("\nAngular velocity statistics (rad/frame):")
-        print(f"  wx (roll):  April std={np.std(april_angular_vel[:, 0]):.6f}, "
-              f"Odom std={np.std(odom_angular_vel[:, 0]):.6f}")
-        print(f"  wy (pitch): April std={np.std(april_angular_vel[:, 1]):.6f}, "
-              f"Odom std={np.std(odom_angular_vel[:, 1]):.6f}")
-        print(f"  wz (yaw):   April std={np.std(april_angular_vel[:, 2]):.6f}, "
-              f"Odom std={np.std(odom_angular_vel[:, 2]):.6f}")
-
-        print("\nAngular velocity ranges (rad/frame):")
-        april_wx_min, april_wx_max = np.min(april_angular_vel[:, 0]), np.max(april_angular_vel[:, 0])
-        april_wy_min, april_wy_max = np.min(april_angular_vel[:, 1]), np.max(april_angular_vel[:, 1])
-        april_wz_min, april_wz_max = np.min(april_angular_vel[:, 2]), np.max(april_angular_vel[:, 2])
-        odom_wx_min, odom_wx_max = np.min(odom_angular_vel[:, 0]), np.max(odom_angular_vel[:, 0])
-        odom_wy_min, odom_wy_max = np.min(odom_angular_vel[:, 1]), np.max(odom_angular_vel[:, 1])
-        odom_wz_min, odom_wz_max = np.min(odom_angular_vel[:, 2]), np.max(odom_angular_vel[:, 2])
-
-        april_wx_mean = np.mean(april_angular_vel[:, 0])
-        april_wy_mean = np.mean(april_angular_vel[:, 1])
-        april_wz_mean = np.mean(april_angular_vel[:, 2])
-        odom_wx_mean = np.mean(odom_angular_vel[:, 0])
-        odom_wy_mean = np.mean(odom_angular_vel[:, 1])
-        odom_wz_mean = np.mean(odom_angular_vel[:, 2])
-
-        print(f"  wx (roll):  April [{april_wx_min:8.5f}, {april_wx_max:8.5f}] mean={april_wx_mean:8.5f}  "
-              f"Odom [{odom_wx_min:8.5f}, {odom_wx_max:8.5f}] mean={odom_wx_mean:8.5f}")
-        print(f"  wy (pitch): April [{april_wy_min:8.5f}, {april_wy_max:8.5f}] mean={april_wy_mean:8.5f}  "
-              f"Odom [{odom_wy_min:8.5f}, {odom_wy_max:8.5f}] mean={odom_wy_mean:8.5f}")
-        print(f"  wz (yaw):   April [{april_wz_min:8.5f}, {april_wz_max:8.5f}] mean={april_wz_mean:8.5f}  "
-              f"Odom [{odom_wz_min:8.5f}, {odom_wz_max:8.5f}] mean={odom_wz_mean:8.5f}")
-    print("\nAngular velocity correlation (frame-to-frame rotation changes):")
-    if np.isnan(corr_roll):
-        print("  Roll (wx):  N/A")
-    else:
-        print(f"  Roll (wx):  {corr_roll:.4f}")
-    if np.isnan(corr_pitch):
-        print("  Pitch (wy): N/A")
-    else:
-        print(f"  Pitch (wy): {corr_pitch:.4f}")
-    if np.isnan(corr_yaw):
-        print("  Yaw (wz):   N/A")
-    else:
-        print(f"  Yaw (wz):   {corr_yaw:.4f}")
-    print("\nAbsolute quaternion correlation (reference only):")
-    print(f"  qx: {corr_qx:.4f}, qy: {corr_qy:.4f}, qz: {corr_qz:.4f}, qw: {corr_qw:.4f}")
-
-    # Compute axis decoupling scores
-    # For each axis, the diagonal correlation should be high and off-diagonal should be low
-    # Build correlation matrix from euler angles
-    corr_matrix = np.zeros((3, 3))
-    for i in range(3):
-        for j in range(3):
-            corr_matrix[i, j] = np.corrcoef(april_eulers_filtered[:, i], odom_eulers_filtered[:, j])[0, 1]
-
-    # Decoupling score for each axis:
-    # Score = |diagonal| - max(|off-diagonal|)
-    # Perfect decoupling: diagonal = 1.0, off-diagonal = 0.0 -> score = 1.0
-    # Complete mixing: diagonal = 0.0, off-diagonal = 1.0 -> score = -1.0
+    # Compute axis mapping quality from the rotation alignment matrix
+    # The columns of R_rot_align represent AprilTag axes in Odom frame
+    # Perfect alignment: each column is a unit vector along one axis (±1 in one component, 0 elsewhere)
     axis_names_short = ['Roll', 'Pitch', 'Yaw']
-    decoupling_scores = []
+
+    # Compute alignment strength for each axis from R_rot_align
+    alignment_strengths = []
+    axis_mapping = []
     for i in range(3):
-        diagonal = abs(corr_matrix[i, i])
-        off_diag = [abs(corr_matrix[i, j]) for j in range(3) if j != i]
-        max_off_diag = max(off_diag)
-        score = diagonal - max_off_diag
-        decoupling_scores.append(score)
+        # Find which odom axis this april axis maps to (column i of R_rot_align)
+        col = R_rot_align[:, i]
+        odom_axis_idx = np.argmax(np.abs(col))
+        strength = np.abs(col[odom_axis_idx])
+        sign = '+' if col[odom_axis_idx] > 0 else '-'
+        alignment_strengths.append(strength)
+        axis_mapping.append((odom_axis_idx, sign, strength))
 
-    # Overall decoupling score (average of all axes)
-    overall_decoupling = np.mean(decoupling_scores)
+    # Overall alignment quality (mean of axis strengths)
+    # Perfect alignment = 1.0, completely off = lower values
+    overall_alignment = np.mean(alignment_strengths)
 
-    # Grade the decoupling
-    def grade_score(score):
-        if score >= 0.8:
+    # Grade the alignment strength (based on rotation matrix column magnitudes)
+    def grade_strength(strength):
+        if strength >= 0.99:
+            return 'A+'
+        elif strength >= 0.95:
             return 'A'
-        elif score >= 0.6:
+        elif strength >= 0.90:
             return 'B'
-        elif score >= 0.4:
+        elif strength >= 0.80:
             return 'C'
-        elif score >= 0.2:
+        elif strength >= 0.70:
             return 'D'
         else:
             return 'F'
@@ -767,46 +584,86 @@ def compare_positions(
     print(f"│  Max Error:      {max_pos_err:6.1f} cm    │  Frames:         {n_inliers:6d}         │")
     print("└─────────────────────────────────────────────────────────────────────┘")
 
+    # Grade rotation speed correlation
+    def grade_corr(corr):
+        if np.isnan(corr):
+            return 'N/A'
+        elif corr >= 0.9:
+            return 'A+'
+        elif corr >= 0.8:
+            return 'A'
+        elif corr >= 0.6:
+            return 'B'
+        elif corr >= 0.4:
+            return 'C'
+        elif corr >= 0.2:
+            return 'D'
+        else:
+            return 'F'
+
+    # Grade cumulative ratio (should be close to 1.0)
+    def grade_ratio(ratio):
+        if np.isnan(ratio):
+            return 'N/A'
+        diff = abs(ratio - 1.0)
+        if diff <= 0.05:
+            return 'A+'
+        elif diff <= 0.1:
+            return 'A'
+        elif diff <= 0.2:
+            return 'B'
+        elif diff <= 0.3:
+            return 'C'
+        elif diff <= 0.5:
+            return 'D'
+        else:
+            return 'F'
+
+    speed_corr_grade = grade_corr(rot_speed_corr)
+    ratio_grade = grade_ratio(cumulative_ratio)
+
     print("\n┌─────────────────────────────────────────────────────────────────────┐")
-    print("│                       ORIENTATION METRICS                          │")
+    print("│                 ORIENTATION METRICS (Invariant)                    │")
     print("├─────────────────────────────────────────────────────────────────────┤")
-    print(f"│  Mean Error:     {mean_angle_err:6.1f} deg   │  Ang Vel Corr (wx): {corr_roll if not np.isnan(corr_roll) else 0:6.4f}  │")
-    print(f"│  Std Error:      {std_angle_err:6.1f} deg   │  Ang Vel Corr (wy): {corr_pitch if not np.isnan(corr_pitch) else 0:6.4f}  │")
-    print(f"│  90th %ile:      {p90_angle:6.1f} deg   │  Ang Vel Corr (wz): {corr_yaw if not np.isnan(corr_yaw) else 0:6.4f}  │")
-    print(f"│  Max Error:      {max_angle_err:6.1f} deg   │                               │")
+    print(f"│  Geodesic Error (angular difference between rotations):           │")
+    print(f"│    Mean:       {mean_angle_err:6.1f} deg    90th %ile:   {p90_angle:6.1f} deg          │")
+    print(f"│    Std:        {std_angle_err:6.1f} deg    Max:         {max_angle_err:6.1f} deg          │")
+    print("├─────────────────────────────────────────────────────────────────────┤")
+    print(f"│  Rotation Activity (frame-independent):                           │")
+    rot_speed_str = f"{rot_speed_corr:6.3f}" if not np.isnan(rot_speed_corr) else "   N/A"
+    ratio_str = f"{cumulative_ratio:6.3f}" if not np.isnan(cumulative_ratio) else "   N/A"
+    print(f"│    Speed Corr: {rot_speed_str}  ({speed_corr_grade:3})  │  Total AprilTag: {april_cumulative:7.1f} deg  │")
+    print(f"│    Cumul Ratio:{ratio_str}  ({ratio_grade:3})  │  Total Odom:     {odom_cumulative:7.1f} deg  │")
     print("└─────────────────────────────────────────────────────────────────────┘")
 
     print("\n┌─────────────────────────────────────────────────────────────────────┐")
-    print("│                     AXIS DECOUPLING ANALYSIS                       │")
+    print("│                   ROTATION AXIS ALIGNMENT (Kabsch)                 │")
     print("├─────────────────────────────────────────────────────────────────────┤")
-    print("│  Correlation Matrix (AprilTag Euler → Odom Euler):                 │")
-    print("│              Odom Roll   Odom Pitch   Odom Yaw                     │")
+    print("│  Axis Mapping (from R_align rotation matrix):                      │")
+    odom_axis_names = ['Odom X', 'Odom Y', 'Odom Z']
     for i, name in enumerate(axis_names_short):
-        print(f"│  {name:5}       {corr_matrix[i, 0]:7.3f}      {corr_matrix[i, 1]:7.3f}      {corr_matrix[i, 2]:7.3f}                    │")
-    print("├─────────────────────────────────────────────────────────────────────┤")
-    print("│  Decoupling Scores (diagonal - max off-diagonal):                  │")
-    for i, name in enumerate(axis_names_short):
-        grade = grade_score(decoupling_scores[i])
-        bar_len = int(max(0, min(20, (decoupling_scores[i] + 1) * 10)))
+        odom_idx, sign, strength = axis_mapping[i]
+        grade = grade_strength(strength)
+        bar_len = int(max(0, min(20, strength * 20)))
         bar = '█' * bar_len + '░' * (20 - bar_len)
-        print(f"│  {name:5}:  {decoupling_scores[i]:+6.3f}  [{bar}]  Grade: {grade}      │")
+        print(f"│  April {name:5} → {sign}{odom_axis_names[odom_idx]:6}  [{bar}] {strength:.3f} ({grade})  │")
     print("├─────────────────────────────────────────────────────────────────────┤")
-    overall_grade = grade_score(overall_decoupling)
-    overall_bar_len = int(max(0, min(20, (overall_decoupling + 1) * 10)))
+    overall_grade = grade_strength(overall_alignment)
+    overall_bar_len = int(max(0, min(20, overall_alignment * 20)))
     overall_bar = '█' * overall_bar_len + '░' * (20 - overall_bar_len)
-    print(f"│  OVERALL: {overall_decoupling:+6.3f}  [{overall_bar}]  Grade: {overall_grade}      │")
+    print(f"│  OVERALL:        [{overall_bar}] {overall_alignment:.3f} ({overall_grade})  │")
     print("└─────────────────────────────────────────────────────────────────────┘")
 
     # Interpretation
     print("\n┌─────────────────────────────────────────────────────────────────────┐")
     print("│                         INTERPRETATION                             │")
     print("├─────────────────────────────────────────────────────────────────────┤")
-    if overall_decoupling >= 0.6:
-        print("│  ✓ Axes are well decoupled - rotation alignment is working well   │")
-    elif overall_decoupling >= 0.3:
-        print("│  ~ Partial decoupling - some axis mixing remains                  │")
+    if overall_alignment >= 0.95:
+        print("│  ✓ Rotation alignment is excellent - axes map cleanly             │")
+    elif overall_alignment >= 0.85:
+        print("│  ~ Rotation alignment is good - minor axis mixing                 │")
     else:
-        print("│  ✗ Significant axis mixing - alignment may need improvement       │")
+        print("│  ✗ Rotation alignment has issues - check camera setup             │")
 
     if mean_pos_err < 10:
         print("│  ✓ Position accuracy is excellent (<10cm)                         │")
@@ -821,6 +678,19 @@ def compare_positions(
         print("│  ~ Orientation accuracy is acceptable (5-10°)                     │")
     else:
         print("│  ✗ Orientation accuracy needs improvement (>10°)                  │")
+
+    # Check rotation activity tracking (invariant metrics)
+    if not np.isnan(rot_speed_corr) and rot_speed_corr >= 0.8:
+        print("│  ✓ Rotation activity tracking is excellent (speed corr >= 0.8)     │")
+    elif not np.isnan(rot_speed_corr) and rot_speed_corr >= 0.5:
+        print("│  ~ Rotation activity tracking is acceptable (speed corr >= 0.5)    │")
+    elif not np.isnan(rot_speed_corr):
+        print("│  ✗ Rotation activity tracking needs work (speed corr < 0.5)        │")
+
+    # Check yaw alignment specifically (most important for ground robots)
+    yaw_strength = alignment_strengths[2]
+    if yaw_strength >= 0.95:
+        print("│  ✓ Yaw alignment is excellent (most important for ground robots)   │")
     print("└─────────────────────────────────────────────────────────────────────┘")
     print("=" * 70)
 
@@ -839,11 +709,8 @@ def compare_positions(
         'correlation_x': corr_x,
         'correlation_y': corr_y,
         'correlation_z': corr_z,
-        'correlation_qx': corr_qx,
-        'correlation_qy': corr_qy,
-        'correlation_qz': corr_qz,
-        'correlation_qw': corr_qw,
-        'correlation_roll': corr_roll,  # Angular velocity correlation (wx)
-        'correlation_pitch': corr_pitch,  # Angular velocity correlation (wy)
-        'correlation_yaw': corr_yaw,  # Angular velocity correlation (wz)
+        'rot_speed_correlation': rot_speed_corr,  # Invariant rotation speed correlation
+        'cumulative_rotation_april': april_cumulative,
+        'cumulative_rotation_odom': odom_cumulative,
+        'cumulative_ratio': cumulative_ratio,
     }
